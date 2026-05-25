@@ -1,0 +1,117 @@
+# ============================================================
+# 港股舆情分析系统 - Git 忽略文件
+# ============================================================
+
+# -------- 环境变量和密钥 --------
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# -------- Python --------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# -------- Virtual Environments --------
+venv/
+ENV/
+env/
+.venv
+.env
+
+# -------- IDE --------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# -------- 测试和覆盖率 --------
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# -------- 数据和日志 --------
+data/
+logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+chroma_db/
+
+# -------- 输出文件 --------
+output/
+results/
+reports/
+*.json
+*.csv
+*.xlsx
+
+# -------- 临时文件 --------
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+.tmp/
+temp/
+
+# -------- 缓存 --------
+.cache/
+*.cache
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# -------- 特定于本项目的文件 --------
+online_test_results/
+annotations.jsonl
+adjustment_log.json
+multilingual_results.json
+analysis_report.json
+test_results.json
+
+# -------- 操作系统 --------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# -------- API 响应缓存 (调试用) --------
+api_responses.json
+*.raw
+
+# -------- 模型缓存 --------
+models/
+*.model
+*.pkl
