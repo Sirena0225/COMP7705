@@ -1,208 +1,122 @@
-# 多语言 + 在线测试 框架
+**项目概述**
 
-项目概述
-========
+本仓库实现一个面向港股舆情的多语言情感分析与在线测试框架，包含：多语言预处理与分析、影子（A/B）测试、评估引擎、自动反馈与人工标注接口。真实运行时请将生产数据放入 `data/` 目录；仓库根目录下的若干 `.json` 文件为示例/模拟数据用于演示和测试。
 
-这是一个用于港股舆情提取与评价的多语言情感分析与在线测试框架的代码仓库，包含多语言预处理与分析模块、在线/影子测试（A/B）框架、评估与自动反馈组件，以及用于人工复核的标注接口。实际用于训练或生产的真实数据应放在 `data/` 目录下；仓库内其余 `.json` 文件主要是用于测试或演示的模拟数据样本。
+**主要目标读者**: 研究人员、工程师、数据工程团队、产品经理。
 
-目录结构（概要）
------------------
 
-工作区主要文件与目录：
+**主要文件（精简）**
 
-- `data/`：真实/样本数据目录。**注意：真实使用时请把真实数据放在此目录下，仓库里的其他 `.json` 文件多为模拟测试数据。**
-- `multilingual_preprocessor.py`：多语言文本预处理（自动语言检测、分词、归一化）。
-- `multilingual_analyzer.py`：多语言分析器，封装与 LLM/规则的联合分析逻辑。
-- `online_test_framework.py`：在线测试主控制器（采样、并行测试、调度）。
-- `data_stream_sampler.py`：数据采样策略实现。
-- `shadow_testing_env.py`：影子测试/A-B 对比环境实现。
-- `evaluation_engine.py`：评估指标计算与报告生成。
-- `metrics_tracker.py`：指标记录与时间序列存储（SQLite）。
-- `feedback_controller.py`：自动反馈/参数调整模块（提示词、阈值、采样策略）。
-- `annotation_interface.py`：人工标注/复核接口（可通过 Streamlit 启动）。
-- `demo_online_testing.py` / `demo_analysis.py`：示例与演示脚本。
-- `requirements.txt`：Python 依赖清单。
+- [data](data)：真实或示例数据目录（请将真实数据放在此目录下）。
+- [multilingual_preprocessor.py](multilingual_preprocessor.py#L1): 多语言预处理器（`MultilingualTextPreprocessor`）。
+- [multilingual_analyzer.py](multilingual_analyzer.py#L1): 多语言分析器（`MultilingualAnalyzer`，含提示词模板与 LLM 调用）。
+- [online_test_framework.py](online_test_framework.py#L1): 在线测试主控（`OnlineTestingFramework`、`OnlineTestConfig`）。
+- [data_stream_sampler.py](data_stream_sampler.py#L1): 数据采样器与流模拟器（`DataStreamSampler`、`JSONDataStream`）。
+- [shadow_testing_env.py](shadow_testing_env.py#L1): 影子测试环境与结果对比工具。
+- [evaluation_engine.py](evaluation_engine.py#L1): 性能评估工具与度量计算。
+- [metrics_tracker.py](metrics_tracker.py#L1): 指标记录与查询（SQLite 存储）。
+- [feedback_controller.py](feedback_controller.py#L1): 自动反馈与调整逻辑（提示词/阈值/采样）。
+- [annotation_interface.py](annotation_interface.py#L1): 人工标注接口与任务管理（Streamlit 支持）。
+- [demo_online_testing.py](demo_online_testing.py#L1): 在线测试演示脚本（多场景示例）。
+- [demo_analysis.py](demo_analysis.py#L1): 舆情分析示例脚本（真实示例文本）。
+- [requirements.txt](requirements.txt#L1): 依赖清单。
 
-快速上手
----------
 
-1. 安装依赖：
+**快速上手**
+
+1) 创建并激活 Python 虚拟环境，安装依赖：
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-2. 运行多语言分析示例：
+2) 运行分析示例（离线演示）：
 
 ```bash
 python demo_analysis.py
 ```
 
-3. 运行在线测试示例（演示模式）：
+3) 运行在线测试演示（本地模拟流 + A/B 流程）：
 
 ```bash
 python demo_online_testing.py
 ```
 
-4. 启动人工标注界面（若仓库提供 Streamlit app）：
+4) 若要启动人工标注界面（若存在 Streamlit 应用）：
 
 ```bash
 streamlit run annotation_interface.py
 ```
 
-使用示例（Python）
--------------------
 
-示例：使用多语言预处理并调用分析器：
+**环境变量**
+
+- 若使用真实 LLM，请设置 `LLM_API_KEY`（和可选 `LLM_MODEL`）：
+
+```bash
+export LLM_API_KEY="your_api_key"
+export LLM_MODEL="deepseek-chat"
+```
+
+如果不设置，框架会以 mock 模型运行以便离线演示和调试。
+
+
+**典型工作流**
+
+1. 数据通过 [data_stream_sampler.py](data_stream_sampler.py#L1) 进入采样器（支持 JSON 数据流和实时推送）。
+2. 采样后的样本由 [online_test_framework.py](online_test_framework.py#L1) 驱动，进入 [shadow_testing_env.py](shadow_testing_env.py#L1) 并行执行生产/候选模型分析。
+3. 评估使用 [evaluation_engine.py](evaluation_engine.py#L1) 计算多维指标，并由 [metrics_tracker.py](metrics_tracker.py#L1) 持久化。
+4. [feedback_controller.py](feedback_controller.py#L1) 根据阈值与评估结果生成调整动作（提示词优化 / 阈值修改 / 采样策略）。
+5. 不一致或低置信度样本会进入 [annotation_interface.py](annotation_interface.py#L1) 供人工复核，生成黄金标签用于后续回训练或提示词改进。
+
+
+**数据说明**
+
+- 将生产数据放在 `data/` 下（例如 `data/*.json`）。仓库内 `sentiment_input_batch.json`、`sentiment_input_with_prices.json` 等为演示/测试数据样例，便于本地调试。
+- 使用真实数据前请确保已通过合规和隐私审查，必要时进行脱敏/审计。
+
+
+**使用示例（Python）**
 
 ```python
 from multilingual_preprocessor import MultilingualTextPreprocessor
 from multilingual_analyzer import MultilingualAnalyzer
 
-text = "腾讯发布了新的季度财报，市场反应积极。"
+text = "腾讯(00700.HK) 发布季度财报，业绩超预期。"
 pre = MultilingualTextPreprocessor()
 chunks = pre.process(text)
 
 analyzer = MultilingualAnalyzer()
-result = analyzer.analyze(chunks)
-print(result)
+res = analyzer.analyze(chunks[0], language='zh')
+print(res)
 ```
 
-在线测试框架示例：
 
-```python
-from online_test_framework import OnlineTestingFramework
+**依赖与环境**
 
-framework = OnlineTestingFramework()
-framework.start()
+见 [requirements.txt](requirements.txt#L1)。主要依赖包括 `jieba`, `nltk`, `openai`（或 DeepSeek 兼容客户端）、`streamlit`、`pandas`、`sqlalchemy` 等。
 
-# 推送单条样本
-framework.push_sample({"id": "s1", "text": "恒生指数今日上涨，市场情绪乐观。"})
 
-# 查询指标
-print(framework.metrics_tracker.get_summary())
-```
+**验证与演示**
 
-关于数据
---------
+- 运行 `python demo_online_testing.py` 将依次演示采样、影子测试、评估、反馈与标注任务的创建（脚本内包含 8 个演示项）。
+- 运行 `python demo_analysis.py` 会演示如何用几个真实示例文本生成分析报告并保存到 `analysis_report.json`。
 
-- 仓库中的 `data/` 目录存放实际使用或示例数据：请把真实数据放到 `data/`。仓库根目录下的 `*.json` 文件（例如 `sentiment_input_batch.json` 等）主要为演示或单元测试所用的模拟数据。使用前请确认数据隐私与合规要求。
 
-文档与进一步阅读
-------------------
+**贡献 & 联系**
 
-- `MULTILINGUAL_GUIDE.md`：多语言模块的使用与实现细节。
-- `ONLINE_TESTING_QUICKSTART.md`：在线测试框架快速上手指南。
-- `ONLINE_TESTING_GUIDE.md`：在线测试架构与原理（深入文档）。
+- 欢迎提交 issue 或 pull request。请先阅读代码注释与示例，遵循仓库的风格和测试约定。
+- 使用真实外部数据时，请在提交前确保已获得相应权限并遵守隐私法规。
 
-建议的下一步
------------
-
-- 若要在本地快速试验：运行 `python demo_online_testing.py` 并观察 `online_test_results/` 输出。
-- 若要部署到生产：准备好 `data/` 中的真实流数据，配置 `requirements.txt` 指定的环境，配置 `OnlineTestConfig` 后以守护进程方式运行 `online_test_framework.py`。
-
-许可与贡献
-------------
-
-如需贡献或复现结果，请参阅仓库中的贡献指南和代码注释。若用于外部数据，请确保遵守相应数据使用和隐私法规。
 
 ---
 
-（已重写：将仓库 README 调整为中文、突出数据目录说明和快速运行示例）
-)
-
-framework = OnlineTestingFramework(config)
-framework.start()
-```
-
----
-
-## 📊 关键指标
-
-### 性能指标
-
-| 指标 | 值 | 说明 |
-|-----|---|------|
-| 中文分词准确率 | 95%+ | jieba分词效果 |
-| 英文分词准确率 | 98%+ | NLTK分词效果 |
-| 语言检测准确率 | 100% | 测试集结果 |
-| 采样处理速度 | < 10ms | 单样本处理 |
-| A/B对比速度 | ~ 200ms | 并行执行 |
-| 一致性评分计算 | < 5ms | 自动计算 |
-| SQLite查询速度 | < 100ms | 指标查询 |
-
-### 覆盖范围
-
-| 维度 | 支持 | 说明 |
-|-----|------|------|
-| 语言 | 中文、英文、混合 | 自动检测 |
-| 来源 | news, social_media, report | 可扩展 |
-| 股票 | 全香港上市股票 | stock_code |
-| 评估指标 | 8种 | 完整的性能维度 |
-| 时间序列 | 24小时+ | 可配置保留期 |
-
----
-
-## ✅ 完成清单
-
-### 系统完整性
-
-- [x] 多语言文本处理 (中文+英文+混合)
-- [x] 自动语言检测
-- [x] 实时数据流处理
-- [x] 并行A/B测试
-- [x] 多维性能评估
-- [x] 自动参数调整
-- [x] 人工标注接口
-- [x] 指标追踪和分析
-
-### 代码质量
-
-- [x] 完整的错误处理
-- [x] 多线程安全
-- [x] 内存优化
-- [x] 性能基准测试
-- [x] 代码注释完整
-- [x] 100%测试覆盖
-
-### 文档质量
-
-- [x] 项目README
-- [x] 快速开始指南
-- [x] 完整架构设计
-- [x] API文档
-- [x] 集成指南
-- [x] 故障排查
-- [x] 运行演示
-
----
-
-## 🎉 总结
-
-本项目包含:
-
-**多语言情感分析系统** (Phase 1) ✅
-- 支持中英文双语处理
-- 自动语言检测
-- 多维情感分析
-
-**在线测试框架** (Phase 2) ✅ **重点**
-- 实时数据处理
-- A/B并行测试
-- 持续性能评估
-- 自动反馈优化
-- 人机协同标注
-
-**系统状态: 🟢 生产就绪**  
-**质量评级: ⭐⭐⭐⭐⭐**  
-
----
-
-## 📞 快速链接
+（说明：README 已根据仓库主要模块与示例脚本重写，突出运行方式、数据位置与典型工作流）
 
 | 资源 | 链接 |
 |-----|------|
-| 快速开始 | [ONLINE_TESTING_QUICKSTART.md](ONLINE_TESTING_QUICKSTART.md) |
 | 完整设计 | [ONLINE_TESTING_GUIDE.md](ONLINE_TESTING_GUIDE.md) |
 | 集成指南 | [INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md) |
 | 运行演示 | `python demo_online_testing.py` |
@@ -210,6 +124,6 @@ framework.start()
 
 ---
 
-**项目更新**: 2024-04-09  
-**系统状态**: 🟢 生产就绪  
+**项目更新**: 2026-05-23  
+**系统状态**: 开发中 
 **版本**: v2.0 (多语言 + 在线测试框架)
