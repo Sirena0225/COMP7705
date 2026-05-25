@@ -1,0 +1,29 @@
+[
+  {
+    "text_id": "zh-001",
+    "language": "zh",
+    "stock_code": "00700.HK",
+    "sentiment_score": 0.75,
+    "polarity": "positive",
+    "risk_count": 1,
+    "composite_score": 0.5325
+  },
+  {
+    "text_id": "en-001",
+    "language": "en",
+    "stock_code": "09988.HK",
+    "sentiment_score": 0.0,
+    "polarity": "neutral",
+    "risk_count": 1,
+    "composite_score": -0.105
+  },
+  {
+    "text_id": "mixed-001",
+    "language": "mixed",
+    "stock_code": "03690.HK",
+    "sentiment_score": 0.75,
+    "polarity": "positive",
+    "risk_count": 1,
+    "composite_score": 0.5325
+  }
+]

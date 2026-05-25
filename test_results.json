@@ -1,0 +1,146 @@
+[
+  {
+    "text_id": "test-001",
+    "stock_code": "00700.HK",
+    "sentiment": {
+      "result_id": "sent_e68d9616ce9c201a",
+      "text_id": "test-001",
+      "stock_code": "00700.HK",
+      "sentiment_score": 0.75,
+      "confidence": 0.85,
+      "polarity": "positive",
+      "categories": {
+        "earnings": 0.8,
+        "regulatory": 0.1,
+        "market": 0.5,
+        "management": 0.3,
+        "product": 0.4
+      },
+      "key_phrases": [
+        "业绩增长",
+        "市场表现好",
+        "前景看好"
+      ],
+      "reasoning": "从文本中识别出了业绩、市场、监管等多维度信号，综合判断股票情绪倾向。",
+      "supporting_evidence": [],
+      "model_version": "mock-analyzer",
+      "processing_time_ms": 100,
+      "created_at": "2026-04-09T12:31:14.587038"
+    },
+    "risks": [
+      {
+        "alert_id": "risk_e68d9616ce9c201a_0",
+        "text_id": "test-001",
+        "stock_code": "00700.HK",
+        "risk_category": "financial_earnings_miss",
+        "risk_level": "yellow",
+        "risk_score": 0.7,
+        "risk_title": "业绩风险",
+        "risk_description": "业绩可能不及预期。",
+        "affected_aspects": [],
+        "source_text_snippet": ".董事会主席兼CEO马化腾表示:\"本季度我们的游戏业务表现强劲.\"",
+        "detected_at": "2026-04-09T12:31:14.587046",
+        "valid_until": null
+      }
+    ],
+    "composite_score": 0.5325,
+    "risk_count": 1,
+    "high_risk_count": 0
+  },
+  {
+    "text_id": "test-002",
+    "stock_code": "09988.HK",
+    "sentiment": {
+      "result_id": "sent_e14b39382652b931",
+      "text_id": "test-002",
+      "stock_code": "09988.HK",
+      "sentiment_score": -0.35,
+      "confidence": 0.85,
+      "polarity": "negative",
+      "categories": {
+        "earnings": 0.2,
+        "regulatory": -0.3,
+        "market": 0.5,
+        "management": 0.3,
+        "product": 0.4
+      },
+      "key_phrases": [
+        "业绩增长",
+        "市场表现好",
+        "前景看好"
+      ],
+      "reasoning": "从文本中识别出了业绩、市场、监管等多维度信号，综合判断股票情绪倾向。",
+      "supporting_evidence": [],
+      "model_version": "mock-analyzer",
+      "processing_time_ms": 100,
+      "created_at": "2026-04-09T12:31:14.587296"
+    },
+    "risks": [
+      {
+        "alert_id": "risk_e14b39382652b931_0",
+        "text_id": "test-002",
+        "stock_code": "09988.HK",
+        "risk_category": "regulatory_antitrust",
+        "risk_level": "yellow",
+        "risk_score": 0.7,
+        "risk_title": "潜在审查风险",
+        "risk_description": "监管部门可能对公司业务进行审查。",
+        "affected_aspects": [],
+        "source_text_snippet": "配合监管部门.",
+        "detected_at": "2026-04-09T12:31:14.587303",
+        "valid_until": null
+      }
+    ],
+    "composite_score": -0.4025,
+    "risk_count": 1,
+    "high_risk_count": 0
+  },
+  {
+    "text_id": "test-003",
+    "stock_code": "03690.HK",
+    "sentiment": {
+      "result_id": "sent_35283d3777ed0ca1",
+      "text_id": "test-003",
+      "stock_code": "03690.HK",
+      "sentiment_score": 0.75,
+      "confidence": 0.85,
+      "polarity": "positive",
+      "categories": {
+        "earnings": 0.8,
+        "regulatory": 0.1,
+        "market": 0.5,
+        "management": 0.3,
+        "product": 0.4
+      },
+      "key_phrases": [
+        "业绩增长",
+        "市场表现好",
+        "前景看好"
+      ],
+      "reasoning": "从文本中识别出了业绩、市场、监管等多维度信号，综合判断股票情绪倾向。",
+      "supporting_evidence": [],
+      "model_version": "mock-analyzer",
+      "processing_time_ms": 100,
+      "created_at": "2026-04-09T12:31:14.587519"
+    },
+    "risks": [
+      {
+        "alert_id": "risk_35283d3777ed0ca1_0",
+        "text_id": "test-003",
+        "stock_code": "03690.HK",
+        "risk_category": "financial_earnings_miss",
+        "risk_level": "yellow",
+        "risk_score": 0.7,
+        "risk_title": "业绩风险",
+        "risk_description": "业绩可能不及预期。",
+        "affected_aspects": [],
+        "source_text_snippet": "风险分析03690.HK: 美团外卖业务收入创新高\n美团03690.HK发布最新数据显示,外卖业务订单量同比增长35,业务收入创历史新高.分析师认为这标志着公司已进入稳健增长阶段,未来前景看好.",
+        "detected_at": "2026-04-09T12:31:14.587524",
+        "valid_until": null
+      }
+    ],
+    "composite_score": 0.5325,
+    "risk_count": 1,
+    "high_risk_count": 0
+  }
+]
