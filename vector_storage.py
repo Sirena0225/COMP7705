@@ -4,14 +4,32 @@
 """
 
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import hashlib
 import json
 
 import chromadb
-from chromadb.config import Settings
 import openai
 import langdetect
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# 阿里云百炼 DashScope OpenAI 兼容 Embedding 端点
+DASHSCOPE_BASE_URL_CN = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DASHSCOPE_BASE_URL_INTL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+DASHSCOPE_DEFAULT_EMBEDDING_MODEL = "text-embedding-v3"
+
+
+def _default_dashscope_base_url() -> str:
+    """根据 DASHSCOPE_REGION 选择地域端点（cn=北京，intl=新加坡，默认 intl）。"""
+    explicit = os.getenv("DASHSCOPE_BASE_URL")
+    if explicit:
+        return explicit
+    region = os.getenv("DASHSCOPE_REGION", "intl").lower()
+    if region in ("cn", "beijing", "china"):
+        return DASHSCOPE_BASE_URL_CN
+    return DASHSCOPE_BASE_URL_INTL
 
 
 class VectorStore:
@@ -23,38 +41,140 @@ class VectorStore:
     def __init__(self, 
                  collection_name: str = "hk_stock_news",
                  persist_directory: str = "./chroma_db",
-                 embedding_model: str = "text-embedding-3-small",
-                 use_enhanced_embedding: bool = False):
+                 embedding_model: Optional[str] = None,
+                 use_enhanced_embedding: bool = False,
+                 embedding_backend: Optional[str] = None):
         
-        self.embedding_model = embedding_model
         self.use_enhanced_embedding = use_enhanced_embedding
-        self.api_key = os.getenv("OPENAI_API_KEY")
+        self.embedding_backend = (
+            embedding_backend or os.getenv("EMBEDDING_BACKEND", "dashscope")
+        )
+        self._local_model = None
+        self.embed_client: Optional[openai.OpenAI] = None
+        self.embedding_dimensions = self._parse_embedding_dimensions()
+        self._setup_embedding_client(embedding_model)
         
-        # 初始化ChromaDB客户端
-        self.client = chromadb.Client(Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=persist_directory
-        ))
+        # 确保持久化目录存在
+        os.makedirs(persist_directory, exist_ok=True)
+
+        # ChromaDB 1.x：使用 PersistentClient 替代已废弃的 Client(Settings(chroma_db_impl=...))
+        self.client = chromadb.PersistentClient(path=persist_directory)
         
-        # 获取或创建集合
+        # 获取或创建集合，使用 metadata 保存语义搜索配置
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
-            metadata={"hnsw:space": "cosine"}  # 使用余弦相似度
+            metadata={"hnsw:space": "cosine"}
         )
-        
-        # 初始化Embedding客户端
-        self.embed_client = openai.OpenAI(api_key=self.api_key)
+
+    @staticmethod
+    def _parse_embedding_dimensions() -> Optional[int]:
+        raw = os.getenv("EMBEDDING_DIMENSIONS")
+        if not raw:
+            return 1024
+        try:
+            return int(raw)
+        except ValueError:
+            return 1024
+
+    def _setup_embedding_client(self, embedding_model: Optional[str]) -> None:
+        """按 backend 初始化嵌入客户端与默认模型。"""
+        backend = self.embedding_backend
+
+        if backend == "auto":
+            if os.getenv("DASHSCOPE_API_KEY"):
+                backend = "dashscope"
+            elif os.getenv("OPENAI_API_KEY"):
+                backend = "openai"
+            else:
+                backend = "local"
+            self.embedding_backend = backend
+
+        if backend == "dashscope":
+            api_key = os.getenv("DASHSCOPE_API_KEY")
+            if not api_key:
+                raise ValueError(
+                    "未设置 DASHSCOPE_API_KEY，请在 .env 中配置阿里云百炼 API Key"
+                )
+            base_url = _default_dashscope_base_url()
+            self.embed_client = openai.OpenAI(api_key=api_key, base_url=base_url)
+            self.embedding_model = embedding_model or os.getenv(
+                "EMBEDDING_MODEL", DASHSCOPE_DEFAULT_EMBEDDING_MODEL
+            )
+            return
+
+        if backend == "openai":
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError("未设置 OPENAI_API_KEY")
+            openai_kwargs: Dict[str, Any] = {"api_key": api_key}
+            base_url = os.getenv("OPENAI_BASE_URL")
+            if base_url:
+                openai_kwargs["base_url"] = base_url
+            self.embed_client = openai.OpenAI(**openai_kwargs)
+            self.embedding_model = embedding_model or os.getenv(
+                "EMBEDDING_MODEL", "text-embedding-3-small"
+            )
+            return
+
+        if backend == "local":
+            self.embedding_model = embedding_model or "all-MiniLM-L6-v2"
+            return
+
+        raise ValueError(
+            f"不支持的 EMBEDDING_BACKEND: {backend}，"
+            "可选: dashscope | openai | local | auto"
+        )
+
+    def _create_api_embedding(
+        self, text: Union[str, List[str]], model: Optional[str] = None
+    ) -> List[float]:
+        """调用远程 Embedding API（百炼 / OpenAI 兼容）。"""
+        if self.embed_client is None:
+            raise RuntimeError("远程嵌入客户端未初始化")
+
+        model = model or self.embedding_model
+        payload: Dict[str, Any] = {
+            "model": model,
+            "input": text,
+            "encoding_format": "float",
+        }
+        if self.embedding_dimensions and model.startswith("text-embedding-v"):
+            payload["dimensions"] = self.embedding_dimensions
+
+        response = self.embed_client.embeddings.create(**payload)
+        return response.data[0].embedding
     
+    def _get_local_model(self):
+        if self._local_model is None:
+            from sentence_transformers import SentenceTransformer
+            self._local_model = SentenceTransformer("all-MiniLM-L6-v2")
+        return self._local_model
+
+    def _get_embedding_local(self, text: str) -> List[float]:
+        text = text[:8000] if len(text) > 8000 else text
+        return self._get_local_model().encode(text).tolist()
+
+    def _use_local_backend(self) -> bool:
+        return self.embedding_backend == "local"
+
+    def _fallback_to_local(self, reason: str):
+        if self.embedding_backend != "auto":
+            raise RuntimeError(reason)
+        print(f"⚠️  {reason}，切换为本地嵌入模型 (all-MiniLM-L6-v2)")
+        self.embedding_backend = "local"
+
     def _get_embedding(self, text: str) -> List[float]:
         """获取文本的向量嵌入"""
-        # 截断长文本
         text = text[:8000] if len(text) > 8000 else text
-        
-        response = self.embed_client.embeddings.create(
-            model=self.embedding_model,
-            input=text
-        )
-        return response.data[0].embedding
+
+        if self._use_local_backend():
+            return self._get_embedding_local(text)
+
+        try:
+            return self._create_api_embedding(text)
+        except Exception as e:
+            self._fallback_to_local(str(e))
+            return self._get_embedding_local(text)
     
     def _get_embedding_enhanced(self, text: str) -> List[float]:
         """
@@ -80,44 +200,26 @@ class VectorStore:
             lang = "unknown"
             print(f"⚠️ 语言检测失败: {str(e)}, 使用默认策略")
         
-        # Step 2: 策略选择
+        # Step 2: 策略选择（百炼统一用 text-embedding-v3，通过前缀区分语言）
         if lang in ["zh-cn", "zh-tw", "zh"]:
-            # 中文为主：使用大模型以获得更好的CJK支持
-            embedding_model = "text-embedding-3-large"
             processed_text = f"[ZH] {text}"
             language_tag = "Chinese"
         elif lang == "en":
-            # 英文：使用小模型以降低成本
-            embedding_model = "text-embedding-3-small"
             processed_text = text
             language_tag = "English"
         else:
-            # 混合/未知语言：使用大模型并添加混合标记
-            embedding_model = "text-embedding-3-large"
             processed_text = f"[MIXED] {text}"
             language_tag = "Mixed/Unknown"
-        
-        # Step 3: 调用API获取嵌入
+
+        # Step 3: 获取嵌入
+        if self._use_local_backend():
+            return self._get_embedding_local(processed_text)
+
         try:
-            response = self.embed_client.embeddings.create(
-                input=[processed_text],
-                model=embedding_model
-            )
-            embedding = response.data[0].embedding
-            
-            # 记录使用的策略
-            print(f"✅ 嵌入生成: 语言={language_tag}, 模型={embedding_model}, "
-                  f"文本长度={len(text)}, 向量维度={len(embedding)}")
-            
-            return embedding
+            return self._create_api_embedding(processed_text)
         except Exception as e:
-            print(f"❌ 嵌入生成失败: {str(e)}, 使用标准模型降级")
-            # 降级处理：使用标准模型
-            response = self.embed_client.embeddings.create(
-                model=self.embedding_model,
-                input=text
-            )
-            return response.data[0].embedding
+            self._fallback_to_local(f"增强嵌入 API 失败: {e}")
+            return self._get_embedding_local(processed_text)
     
     def add_text(self, 
                  text_id: str,
@@ -261,8 +363,11 @@ class VectorStore:
         
         输出：匹配文档列表，包含内容和相似度分数
         """
-        # 生成查询向量
-        query_embedding = self._get_embedding(query)
+        # 生成查询向量（须与入库时相同的嵌入策略，避免维度不一致）
+        if self.use_enhanced_embedding:
+            query_embedding = self._get_embedding_enhanced(query)
+        else:
+            query_embedding = self._get_embedding(query)
         
         # 构建过滤条件
         where_clause = {}

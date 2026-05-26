@@ -16,8 +16,8 @@ logger = logging.getLogger("TextAnalysisModule")
 
 # 导入各组件
 from models import RawText, TextSource, AnalysisOutput
-from preprocessor import TextPreprocessor
-from analyzer import OptimizedLLMAnalyzer
+from multilingual_preprocessor import MultilingualTextPreprocessor
+from multilingual_analyzer import MultilingualAnalyzer, RAGLLMAdapter
 from vector_storage import VectorStore, RAGQueryEngine
 
 
@@ -31,16 +31,17 @@ class TextAnalysisPipeline:
         logger.info("初始化文本分析管道...")
         
         # 初始化各组件
-        self.preprocessor = TextPreprocessor()
-        self.analyzer = OptimizedLLMAnalyzer(
+        self.preprocessor = MultilingualTextPreprocessor()
+        llm = MultilingualAnalyzer(
             model_name=os.getenv("LLM_MODEL", "deepseek-chat"),
-            api_key=os.getenv("LLM_API_KEY")
+            api_key=os.getenv("LLM_API_KEY"),
         )
+        self.analyzer = llm
         self.vector_store = VectorStore(
             collection_name="hk_stock_analysis",
-            persist_directory="./data/chroma_db"
+            persist_directory="./data/chroma_db",
         )
-        self.rag_engine = RAGQueryEngine(self.vector_store, self.analyzer)
+        self.rag_engine = RAGQueryEngine(self.vector_store, RAGLLMAdapter(llm))
         
         # 统计
         self.processed_count = 0
@@ -67,7 +68,8 @@ class TextAnalysisPipeline:
                 return None
             
             # 批量分析
-            analysis_results = self.analyzer.analyze_batch(relevant_chunks)
+            lang = raw_text.language if raw_text.language != "mixed" else "zh"
+            analysis_results = self.analyzer.analyze_batch(relevant_chunks, language=lang)
             logger.info(f"  完成 {len(analysis_results)} 条分析")
             
             # 步骤3：合并结果（同一text_id的多股票结果）
@@ -181,110 +183,91 @@ class TextAnalysisPipeline:
         }
 
 
-# FastAPI接口（用于与主系统集成）
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-
-app = FastAPI(title="文本分析模块API", version="1.0")
 pipeline = TextAnalysisPipeline()
+app = None
 
-# 请求/响应模型
-class TextInput(BaseModel):
-    text_id: str
-    title: str
-    content: str
-    stock_codes: List[str]
-    stock_names: List[str]
-    source_type: str
-    source_name: str
-    publish_time: Optional[str] = None
 
-class SentimentQuery(BaseModel):
-    stock_code: str
-    days: int = 7
+def create_api_app():
+    """创建 FastAPI 应用（需安装 fastapi、uvicorn）。"""
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel
 
-class RAGQuery(BaseModel):
-    question: str
-    stock_code: Optional[str] = None
+    api = FastAPI(title="文本分析模块API", version="1.0")
 
-@app.post("/analyze", response_model=dict)
-async def analyze_text(input_data: TextInput):
-    """
-    分析单条文本
-    """
-    raw = RawText(
-        text_id=input_data.text_id,
-        title=input_data.title,
-        content=input_data.content,
-        stock_codes=input_data.stock_codes,
-        stock_names=input_data.stock_names,
-        source=TextSource(
-            source_type=input_data.source_type,
-            source_name=input_data.source_name,
-            publish_time=datetime.fromisoformat(input_data.publish_time) if input_data.publish_time else None
+    class TextInput(BaseModel):
+        text_id: str
+        title: str
+        content: str
+        stock_codes: List[str]
+        stock_names: List[str]
+        source_type: str
+        source_name: str
+        publish_time: Optional[str] = None
+
+    class RAGQuery(BaseModel):
+        question: str
+        stock_code: Optional[str] = None
+
+    @api.post("/analyze", response_model=dict)
+    async def analyze_text(input_data: TextInput):
+        raw = RawText(
+            text_id=input_data.text_id,
+            title=input_data.title,
+            content=input_data.content,
+            stock_codes=input_data.stock_codes,
+            stock_names=input_data.stock_names,
+            source=TextSource(
+                source_type=input_data.source_type,
+                source_name=input_data.source_name,
+                publish_time=datetime.fromisoformat(input_data.publish_time)
+                if input_data.publish_time
+                else None,
+            ),
         )
-    )
-    
-    result = pipeline.process_single(raw)
-    if not result:
-        raise HTTPException(status_code=500, detail="分析失败")
-    
-    return result.to_dict()
+        result = pipeline.process_single(raw)
+        if not result:
+            raise HTTPException(status_code=500, detail="分析失败")
+        return result.to_dict()
 
-@app.post("/analyze/batch")
-async def analyze_batch(texts: List[TextInput]):
-    """
-    批量分析
-    """
-    raws = [RawText(
-        text_id=t.text_id,
-        title=t.title,
-        content=t.content,
-        stock_codes=t.stock_codes,
-        stock_names=t.stock_names,
-        source=TextSource(
-            source_type=t.source_type,
-            source_name=t.source_name
-        )
-    ) for t in texts]
-    
-    results = pipeline.process_batch(raws)
-    return {"processed": len(results), "results": [r.to_dict() for r in results]}
+    @api.post("/analyze/batch")
+    async def analyze_batch(texts: List[TextInput]):
+        raws = [
+            RawText(
+                text_id=t.text_id,
+                title=t.title,
+                content=t.content,
+                stock_codes=t.stock_codes,
+                stock_names=t.stock_names,
+                source=TextSource(
+                    source_type=t.source_type, source_name=t.source_name
+                ),
+            )
+            for t in texts
+        ]
+        results = pipeline.process_batch(raws)
+        return {"processed": len(results), "results": [r.to_dict() for r in results]}
 
-@app.get("/sentiment/{stock_code}")
-async def get_sentiment(stock_code: str, days: int = 7):
-    """
-    获取股票情绪趋势
-    """
-    return pipeline.query_sentiment(stock_code, days)
+    @api.get("/sentiment/{stock_code}")
+    async def get_sentiment(stock_code: str, days: int = 7):
+        return pipeline.query_sentiment(stock_code, days)
 
-@app.get("/risks/{stock_code}")
-async def get_risks(stock_code: str):
-    """
-    获取股票风险警报
-    """
-    return pipeline.query_risks(stock_code)
+    @api.get("/risks/{stock_code}")
+    async def get_risks(stock_code: str):
+        return pipeline.query_risks(stock_code)
 
-@app.post("/rag/query")
-async def rag_query(query: RAGQuery):
-    """
-    RAG问答
-    """
-    return pipeline.rag_query(query.question, query.stock_code)
+    @api.post("/rag/query")
+    async def rag_query(query: RAGQuery):
+        return pipeline.rag_query(query.question, query.stock_code)
 
-@app.get("/stats")
-async def get_stats():
-    """
-    获取模块统计
-    """
-    return pipeline.get_stats()
+    @api.get("/stats")
+    async def get_stats():
+        return pipeline.get_stats()
 
-@app.get("/health")
-async def health_check():
-    """
-    健康检查
-    """
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    @api.get("/health")
+    async def health_check():
+        return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+    return api
 
 
 # 消息队列消费者（异步处理）
@@ -316,8 +299,8 @@ async def message_queue_consumer():
 
 if __name__ == "__main__":
     import uvicorn
-    
-    # 启动API服务
+
+    app = create_api_app()
     uvicorn.run(app, host="0.0.0.0", port=8001)
     
     # 同时启动队列消费者（需要异步运行）

@@ -449,3 +449,21 @@ class MultilingualAnalyzer:
             "model": self.model_name,
             "language_distribution": self.language_stats
         }
+
+
+class RAGLLMAdapter:
+    """将 MultilingualAnalyzer 适配为 RAGQueryEngine 所需的 _call_llm(prompt) 接口。"""
+
+    def __init__(self, analyzer: MultilingualAnalyzer, language: str = "en"):
+        self.analyzer = analyzer
+        self.language = language
+
+    def _call_llm(self, prompt: str, temperature: float = 0.1) -> Dict[str, Any]:
+        return self.analyzer._call_llm(prompt, self.language, temperature)
+
+    def get_stats(self) -> Dict[str, Any]:
+        return self.analyzer.get_stats()
+
+
+# 历史命名兼容
+MultilingualSentimentAnalyzer = MultilingualAnalyzer

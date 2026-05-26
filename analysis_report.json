@@ -1,28 +1,28 @@
 {
-  "timestamp": "2026-04-09T12:32:18.368893",
+  "timestamp": "2026-05-26T18:46:17.163982",
   "analysis_count": 4,
   "summary": {
     "total_reports": 4,
-    "risk_alerts": 4,
-    "high_risk_count": 2,
-    "neutral_count": 0,
+    "risk_alerts": 0,
+    "high_risk_count": 0,
+    "neutral_count": 2,
     "low_risk_count": 2
   },
   "stock_sentiment": {
     "00700.HK": {
-      "avg_score": 0.5325,
+      "avg_score": 0.6000000000000001,
       "samples": 1
     },
     "09988.HK": {
-      "avg_score": -0.40249999999999997,
+      "avg_score": -0.1875,
       "samples": 1
     },
     "03690.HK": {
-      "avg_score": 0.5325,
+      "avg_score": 0.30000000000000004,
       "samples": 1
     },
     "01810.HK": {
-      "avg_score": -0.40249999999999997,
+      "avg_score": -0.1875,
       "samples": 1
     }
   },
@@ -31,40 +31,40 @@
       "stock_code": "00700.HK",
       "stock_name": "腾讯控股",
       "text_id": "news-20240409-001",
-      "sentiment_score": 0.75,
+      "sentiment_score": 0.8,
       "polarity": "positive",
-      "risk_count": 1,
-      "composite_score": 0.5325,
+      "risk_count": 0,
+      "composite_score": 0.6000000000000001,
       "title": "腾讯宣布Q1季度创纪录业绩，云服务和游戏业务齐增长"
     },
     {
       "stock_code": "09988.HK",
       "stock_name": "阿里巴巴-SW",
       "text_id": "news-20240409-002",
-      "sentiment_score": -0.35,
+      "sentiment_score": -0.25,
       "polarity": "negative",
-      "risk_count": 1,
-      "composite_score": -0.40249999999999997,
+      "risk_count": 0,
+      "composite_score": -0.1875,
       "title": "阿里巴巴国际业务面临新的监管审查，短期承压"
     },
     {
       "stock_code": "03690.HK",
       "stock_name": "美团",
       "text_id": "news-20240409-003",
-      "sentiment_score": 0.75,
+      "sentiment_score": 0.4,
       "polarity": "positive",
-      "risk_count": 1,
-      "composite_score": 0.5325,
+      "risk_count": 0,
+      "composite_score": 0.30000000000000004,
       "title": "美团2024年Q1外卖业务爆炸性增长，利润率创新高"
     },
     {
       "stock_code": "01810.HK",
       "stock_name": "小米集团",
       "text_id": "news-20240409-004",
-      "sentiment_score": -0.35,
+      "sentiment_score": -0.25,
       "polarity": "negative",
-      "risk_count": 1,
-      "composite_score": -0.40249999999999997,
+      "risk_count": 0,
+      "composite_score": -0.1875,
       "title": "小米汽车首款车型销售遭遇冷遇，市场需求低于预期"
     }
   ]

@@ -51,7 +51,7 @@ class OnlineTestConfig:
     use_mock_models: bool = not bool(os.getenv("LLM_API_KEY"))  # 无API时使用Mock
     
     # 输出路径
-    output_dir: str = "/Users/mac/sandbox/HKU/COMP7705/online_test_results"
+    output_dir: str = "./online_test_results"
 
 
 class OnlineTestingFramework:
@@ -418,43 +418,3 @@ class OnlineTestingFramework:
         print(f"  已完成: {annotation_stats['total_completed']}")
 
 
-def create_online_testing_demo():
-    """创建在线测试演示"""
-    print("\n" + "="*70)
-    print("🎬 在线测试框架演示")
-    print("="*70)
-    
-    # 初始化框架
-    config = OnlineTestConfig(
-        sampling_rate=0.1,
-        evaluation_interval_seconds=5,  # 每5秒评估一次
-        evaluation_batch_size=10
-    )
-    
-    framework = OnlineTestingFramework(config)
-    framework.start()
-    
-    # 模拟实时数据流
-    from data_stream_sampler import RealTimeDataStream
-    
-    stream = RealTimeDataStream(
-        sampler=framework.sampler,
-        rate=20  # 每秒20个样本
-    )
-    
-    # 运行30秒
-    print("\n⏱️  运行30秒的实时数据模拟...")
-    stream.start_streaming(duration_seconds=30)
-    
-    # 等待处理完成
-    time.sleep(5)
-    
-    # 打印总结
-    framework.print_summary()
-    framework.stop()
-    
-    print("\n✅ 演示完成")
-
-
-if __name__ == "__main__":
-    create_online_testing_demo()

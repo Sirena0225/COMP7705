@@ -3,12 +3,13 @@
 展示实时数据处理、A/B测试、评估和反馈的完整流程
 """
 
+import argparse
 import time
-import sys
+import threading
 from pathlib import Path
 
-# 添加路径
-sys.path.insert(0, '/Users/mac/sandbox/HKU/COMP7705')
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_DATA = PROJECT_ROOT / "data" / "sentiment_input_batch.json"
 
 from data_stream_sampler import (
     DataStreamSampler,
@@ -351,12 +352,12 @@ def demo_json_data_stream():
     # 创建 JSON 数据流
     json_stream = JSONDataStream(
         sampler=sampler,
-        json_file_path="/Users/mac/sandbox/HKU/COMP7705/data/sentiment_input_batch.json",
+        json_file_path=str(DEFAULT_DATA),
         rate=50  # 每秒推送50个样本
     )
     
     print("\n📂 使用 JSON 数据源:")
-    print(f"  文件: /Users/mac/sandbox/HKU/COMP7705/data/sentiment_input_batch.json")
+    print(f"  文件: {DEFAULT_DATA}")
     print(f"  推送速率: 50 样本/秒")
     
     # 在后台线程运行数据流
@@ -421,7 +422,7 @@ def demo_complete_online_testing():
     
     json_stream = JSONDataStream(
         sampler=framework.sampler,
-        json_file_path="/Users/mac/sandbox/HKU/COMP7705/data/sentiment_input_batch.json",
+        json_file_path=str(DEFAULT_DATA),
         rate=50  # 每秒推送50个样本
     )
     
@@ -446,77 +447,34 @@ def demo_complete_online_testing():
 
 
 def main():
-    """运行所有演示"""
-    
-    print("\n" + "="*70)
-    print("🎬 港股舆情 - 在线测试框架完整演示")
-    print("="*70)
-    print("""
-本演示展示以下功能:
+    """默认运行端到端在线测试；--full 运行全部分项演示。"""
+    parser = argparse.ArgumentParser(description="港股舆情在线测试演示")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="依次运行采样、影子测试、评估等分项演示",
+    )
+    args = parser.parse_args()
 
-1️⃣  数据流采样器 - 从实时流中按策略采样
-2️⃣  JSON 数据流 - 从真实 /data 目录加载数据
-3️⃣  影子测试环境 - 并行A/B测试新旧模型
-4️⃣  评估引擎 - 计算多维度性能指标
-5️⃣  指标追踪器 - 时间序列性能监控
-6️⃣  反馈控制器 - 自动参数调整
-7️⃣  人工标注接口 - 专家复核和标注
-8️⃣  完整框架 - 所有组件协同工作
-    """)
-    
-    input("按Enter开始演示...\n")
-    
+    print("\n" + "=" * 70)
+    print("🎬 港股舆情 - 在线测试演示")
+    print("=" * 70)
+
     try:
-        # 运行演示
-        demo_data_stream_sampler()
-        input("\n按Enter继续下一个演示...\n")
-        
-        demo_json_data_stream()
-        input("\n按Enter继续下一个演示...\n")
-        
-        demo_shadow_testing()
-        input("\n按Enter继续下一个演示...\n")
-        
-        demo_evaluation_engine()
-        input("\n按Enter继续下一个演示...\n")
-        
-        demo_metrics_tracker()
-        input("\n按Enter继续下一个演示...\n")
-        
-        demo_feedback_controller()
-        input("\n按Enter继续下一个演示...\n")
-        
-        demo_annotation_interface()
-        input("\n按Enter继续最后的演示...\n")
-        
+        if args.full:
+            for fn in (
+                demo_data_stream_sampler,
+                demo_json_data_stream,
+                demo_shadow_testing,
+                demo_evaluation_engine,
+                demo_metrics_tracker,
+                demo_feedback_controller,
+                demo_annotation_interface,
+            ):
+                fn()
+            print()
         demo_complete_online_testing()
-        
-        print("\n" + "="*70)
-        print("✅ 所有演示完成！")
-        print("="*70)
-        
-        print("""
-关键要点总结:
-
-📊 在线测试框架提供:
-  ✓ 实时数据处理 - 不需要离线数据集
-  ✓ 持续评估 - 自动计算指标并形成时间序列
-  ✓ 人机协同 - 低置信度样本自动触发人工复核
-  ✓ A/B对比 - 新旧模型并行运行，自动对比
-  ✓ 自动反馈 - 根据评估结果自动调整参数
-
-📁 生成的文件:
-  - /Users/mac/sandbox/HKU/COMP7705/online_test_results/
-  - /Users/mac/sandbox/HKU/COMP7705/metrics.db
-  - /Users/mac/sandbox/HKU/COMP7705/annotations.jsonl
-  - /Users/mac/sandbox/HKU/COMP7705/annotation_app.py (Streamlit)
-
-🚀 下一步:
-  1. 查看ONLINE_TESTING_GUIDE.md了解详细设计
-  2. 运行: streamlit run annotation_app.py 启动标注界面
-  3. 集成到生产系统中进行实际测试
-        """)
-        
+        print("\n✅ 演示完成。输出目录: ./online_test_results/")
     except KeyboardInterrupt:
         print("\n⚠️  演示已中断")
     except Exception as e:

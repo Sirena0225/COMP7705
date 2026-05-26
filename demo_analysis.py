@@ -6,8 +6,8 @@
 import json
 from datetime import datetime
 from models import RawText, TextSource
-from preprocessor import TextPreprocessor
-from test_complete_flow import MockLLMAnalyzer
+from multilingual_preprocessor import MultilingualTextPreprocessor
+from mocks.mock_llm import MockLLMAnalyzer
 
 import logging
 logging.basicConfig(
@@ -144,7 +144,7 @@ def analyze_and_report():
     
     # 准备数据
     raw_texts = create_real_world_examples()
-    preprocessor = TextPreprocessor()
+    preprocessor = MultilingualTextPreprocessor()
     analyzer = MockLLMAnalyzer()
     
     # 存储所有分析结果
@@ -163,7 +163,8 @@ def analyze_and_report():
         # 分析
         relevant_chunks = [c for c in chunks if c.is_relevant]
         if relevant_chunks:
-            results = analyzer.analyze_batch(relevant_chunks)
+            lang = raw_text.language if raw_text.language != "mixed" else "zh"
+            results = analyzer.analyze_batch(relevant_chunks, language=lang)
             
             for result in results:
                 logger.info(f"\n【分析结果】 {result.stock_code}")
@@ -244,7 +245,7 @@ def analyze_and_report():
     logger.info(f"低风险报告: {low_risk} 篇")
     
     # 保存详细结果
-    output_file = "/Users/mac/sandbox/HKU/COMP7705/analysis_report.json"
+    output_file = "analysis_report.json"
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump({
             "timestamp": datetime.now().isoformat(),

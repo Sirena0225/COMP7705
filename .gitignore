@@ -69,6 +69,9 @@ logs/
 *.sqlite
 *.sqlite3
 chroma_db/
+rag_db/
+rag_experiment_results.json
+rag_db_test/
 
 # -------- 输出文件 --------
 output/

@@ -1,127 +1,126 @@
-**项目概述**
+# 港股舆情多语言分析系统
 
-本仓库实现一个面向港股舆情的多语言情感分析与在线测试框架，包含：多语言预处理与分析、影子（A/B）测试、评估引擎、自动反馈与人工标注接口。真实运行时请将生产数据放入 `data/` 目录；仓库根目录下的若干 `.json` 文件为示例/模拟数据用于演示和测试。
+面向港股新闻/公告的多语言情感分析、RAG 语义检索与在线 A/B 测试框架。课程与实验数据默认放在 `data/` 目录。
 
+## 项目结构
 
-**主要文件（精简）**
+```
+COMP7705/
+├── main.py                          # 主管线 + FastAPI 服务（:8001）
+├── models.py                        # 共享数据模型
+├── multilingual_preprocessor.py     # 多语言预处理
+├── multilingual_analyzer.py           # 多语言 LLM 分析 + RAG 适配器
+├── vector_storage.py                # ChromaDB 向量库 + RAG 检索
+├── run_rag_retrieval_experiment.py  # RAG 检索精度实验（推荐）
+├── evaluation/
+│   └── retrieval_eval.py            # Top-1 / Recall@5 / MRR / NDCG@5 等指标
+├── online_test_framework.py         # 在线测试主控
+├── shadow_testing_env.py            # 影子 A/B 测试
+├── evaluation_engine.py             # 评估引擎
+├── metrics_tracker.py               # 指标持久化（SQLite）
+├── feedback_controller.py           # 自动反馈调参
+├── annotation_interface.py          # 人工标注任务
+├── data_stream_sampler.py           # 数据流采样
+├── json_data_loader.py              # JSON → 采样样本
+├── demo_analysis.py                 # 离线舆情分析演示（Mock LLM）
+├── demo_online_testing.py           # 在线测试演示
+├── setup.py / setup_llm.py          # 环境安装与 API 校验
+└── mocks/mock_llm.py                # 无 API 时的 Mock 分析器
+```
 
-- [data](data)：真实或示例数据目录（请将真实数据放在此目录下）。
-- [multilingual_preprocessor.py](multilingual_preprocessor.py#L1): 多语言预处理器（`MultilingualTextPreprocessor`）。
-- [multilingual_analyzer.py](multilingual_analyzer.py#L1): 多语言分析器（`MultilingualAnalyzer`，含提示词模板与 LLM 调用）。
-- [online_test_framework.py](online_test_framework.py#L1): 在线测试主控（`OnlineTestingFramework`、`OnlineTestConfig`）。
-- [data_stream_sampler.py](data_stream_sampler.py#L1): 数据采样器与流模拟器（`DataStreamSampler`、`JSONDataStream`）。
-- [shadow_testing_env.py](shadow_testing_env.py#L1): 影子测试环境与结果对比工具。
-- [evaluation_engine.py](evaluation_engine.py#L1): 性能评估工具与度量计算。
-- [metrics_tracker.py](metrics_tracker.py#L1): 指标记录与查询（SQLite 存储）。
-- [feedback_controller.py](feedback_controller.py#L1): 自动反馈与调整逻辑（提示词/阈值/采样）。
-- [annotation_interface.py](annotation_interface.py#L1): 人工标注接口与任务管理（Streamlit 支持）。
-- [demo_online_testing.py](demo_online_testing.py#L1): 在线测试演示脚本（多场景示例）。
-- [demo_analysis.py](demo_analysis.py#L1): 舆情分析示例脚本（真实示例文本）。
-- [requirements.txt](requirements.txt#L1): 依赖清单。
+## 快速开始
 
-
-**快速上手**
-
-1) 创建并激活 Python 虚拟环境，安装依赖：
+### 1. 安装依赖
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
+cp .env.example .env   # 填入密钥后编辑 .env
+python setup.py        # 可选：创建目录与检查依赖
+python setup_llm.py    # 可选：校验 LLM / Embedding API
 ```
 
-2) 运行分析示例（离线演示）：
+### 2. 环境变量（`.env`）
+
+| 变量 | 说明 |
+|------|------|
+| `LLM_API_KEY` | DeepSeek 等 LLM API Key（舆情分析） |
+| `LLM_MODEL` | 默认 `deepseek-chat` |
+| `DASHSCOPE_API_KEY` | 阿里云百炼 Key（**Embedding 默认使用**） |
+| `DASHSCOPE_REGION` | `intl`（新加坡，默认）或 `cn`（北京） |
+| `EMBEDDING_BACKEND` | `dashscope`（默认）/ `openai` / `local` / `auto` |
+| `EMBEDDING_MODEL` | 默认 `text-embedding-v3` |
+
+### 3. 常用命令
 
 ```bash
+# RAG 检索精度实验（构建向量库 + 评估，结果写入 rag_experiment_results.json）
+python run_rag_retrieval_experiment.py
+
+# 离线舆情分析演示（无需 LLM Key，使用 Mock）
 python demo_analysis.py
-```
 
-3) 运行在线测试演示（本地模拟流 + A/B 流程）：
-
-```bash
+# 在线测试端到端演示（JSON 数据流 + 影子测试 + 评估）
 python demo_online_testing.py
+
+# 分项演示（采样、评估、标注等）
+python demo_online_testing.py --full
+
+# 启动 API 服务（需 pip install fastapi uvicorn）
+python main.py
 ```
 
-4) 若要启动人工标注界面（暂未完善该部分）：
+## 两条主线
 
-```bash
-streamlit run annotation_interface.py
-```
+### A. 舆情分析管线
 
+`RawText` → `MultilingualTextPreprocessor` → `MultilingualAnalyzer` → `VectorStore` / `RAGQueryEngine`
 
-**环境变量**
+- **入口**：`main.py`（`TextAnalysisPipeline`）、`demo_analysis.py`（Mock）
+- **API**：`POST /analyze`、`GET /sentiment/{code}`、`POST /rag/query` 等
 
-- 若使用真实 LLM，请设置 `LLM_API_KEY`（和可选 `LLM_MODEL`）：
+### B. RAG 检索实验
 
-```bash
-export LLM_API_KEY="your_api_key"
-export LLM_MODEL="deepseek-chat"
-```
+`run_rag_retrieval_experiment.py` 一键完成：
 
-如果不设置，框架会以 mock 模型运行以便离线演示和调试。
+1. 加载 `data/sentiment_input_batch.json`
+2. 百炼 Embedding 写入 ChromaDB（`./rag_db`）
+3. 自动生成测试查询并评估
 
+**输出指标**：Top-1 Accuracy、Top-5 Recall、MRR、NDCG@5、Avg. Retrieval Latency
 
-**典型工作流**
+### C. 在线测试框架
 
-1. 数据通过 [data_stream_sampler.py](data_stream_sampler.py#L1) 进入采样器（支持 JSON 数据流和实时推送）。
-2. 采样后的样本由 [online_test_framework.py](online_test_framework.py#L1) 驱动，进入 [shadow_testing_env.py](shadow_testing_env.py#L1) 并行执行生产/候选模型分析。
-3. 评估使用 [evaluation_engine.py](evaluation_engine.py#L1) 计算多维指标，并由 [metrics_tracker.py](metrics_tracker.py#L1) 持久化。
-4. [feedback_controller.py](feedback_controller.py#L1) 根据阈值与评估结果生成调整动作（提示词优化 / 阈值修改 / 采样策略）。
-5. 不一致或低置信度样本会进入 [annotation_interface.py](annotation_interface.py#L1) 供人工复核，生成黄金标签用于后续回训练或提示词改进。
+`data_stream_sampler` → `OnlineTestingFramework` → `ShadowTestingEnvironment` → `EvaluationEngine` → `FeedbackController`
 
+- 无 `LLM_API_KEY` 时影子测试自动使用 `MockLLMAnalyzer`
+- 设计细节见 [ONLINE_TESTING_GUIDE.md](ONLINE_TESTING_GUIDE.md)
 
-**数据说明**
+## 数据格式
 
-- 将生产数据放在 `data/` 下（例如 `data/*.json`）。仓库内 `sentiment_input_batch.json`、`sentiment_input_with_prices.json` 等为演示/测试数据样例，便于本地调试。
-- 使用真实数据前请确保已通过合规和隐私审查，必要时进行脱敏/审计。
+批量 JSON 字段说明见 [JSON_FORMAT_GUIDE.md](JSON_FORMAT_GUIDE.md)。示例数据：
 
+- `data/sentiment_input_batch.json`
 
-**使用示例（Python）**
+## 精简说明（2026-05）
 
-```python
-from multilingual_preprocessor import MultilingualTextPreprocessor
-from multilingual_analyzer import MultilingualAnalyzer
+已移除与主线重复的模块，统一为**一套多语言栈**：
 
-text = "腾讯(00700.HK) 发布季度财报，业绩超预期。"
-pre = MultilingualTextPreprocessor()
-chunks = pre.process(text)
+| 已删除 | 原因 |
+|--------|------|
+| `preprocessor.py` / `analyzer.py` | 由 `multilingual_*` 替代 |
+| `demo_enhanced_embedding.py` | 逻辑已并入 `vector_storage.py` |
+| `agent/`、`tools/financial_tools.py` | 未接入主流程的占位代码 |
+| `evaluation/run_evaluation.py` | 接口过时；RAG 评估用 `run_rag_retrieval_experiment.py` |
+| 多份重复 Markdown 指南 | 内容合并进本 README |
 
-analyzer = MultilingualAnalyzer()
-res = analyzer.analyze(chunks[0], language='zh')
-print(res)
-```
+## 延伸阅读
 
+- [ONLINE_TESTING_GUIDE.md](ONLINE_TESTING_GUIDE.md) — 在线测试架构
+- [JSON_FORMAT_GUIDE.md](JSON_FORMAT_GUIDE.md) — 输入 JSON 规范
+- [API_CONTACT.md](API_CONTACT.md) — API 与联系方式
 
-**依赖与环境**
+## 许可与数据
 
-见 [requirements.txt](requirements.txt#L1)。主要依赖包括 `jieba`, `nltk`, `openai`（或 DeepSeek 兼容客户端）、`streamlit`、`pandas`、`sqlalchemy` 等。
-
-
-**验证与演示**
-
-- 运行 `python demo_online_testing.py` 将依次演示采样、影子测试、评估、反馈与标注任务的创建（脚本内包含 8 个演示项）。
-- 运行 `python demo_analysis.py` 会演示如何用几个真实示例文本生成分析报告并保存到 `analysis_report.json`。
-
-
-**贡献 & 联系**
-
-- 欢迎提交 issue 或 pull request。请先阅读代码注释与示例，遵循仓库的风格和测试约定。
-- 使用真实外部数据时，请在提交前确保已获得相应权限并遵守隐私法规。
-
-
----
-
-（说明：README 已根据仓库主要模块与示例脚本重写，突出运行方式、数据位置与典型工作流）
-
-| 资源 | 链接 |
-|-----|------|
-| 完整设计 | [ONLINE_TESTING_GUIDE.md](ONLINE_TESTING_GUIDE.md) |
-| 集成指南 | [INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md) |
-| 运行演示 | `python demo_online_testing.py` |
-| 标注应用 | `streamlit run annotation_app.py` |
-
----
-
-**项目更新**: 2026-05-23  
-**系统状态**: 开发中 
-**版本**: v2.0 (多语言 + 在线测试框架)
+使用真实外部数据前请完成合规与脱敏审查。示例 JSON 仅用于课程实验。
