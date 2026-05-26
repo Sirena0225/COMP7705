@@ -12,6 +12,9 @@ COMP7705/
 ├── multilingual_analyzer.py           # 多语言 LLM 分析 + RAG 适配器
 ├── vector_storage.py                # ChromaDB 向量库 + RAG 检索
 ├── run_rag_retrieval_experiment.py  # RAG 检索精度实验（推荐）
+├── run_react_agent_poc.py           # ReAct Agent PoC（依赖 rag_db + LLM）
+├── agent/sentinel_agent.py          # LangGraph ReAct 编排
+├── tools/financial_tools.py       # 向量检索 / 行情工具
 ├── evaluation/
 │   └── retrieval_eval.py            # Top-1 / Recall@5 / MRR / NDCG@5 等指标
 ├── online_test_framework.py         # 在线测试主控
@@ -67,6 +70,11 @@ python demo_online_testing.py
 # 分项演示（采样、评估、标注等）
 python demo_online_testing.py --full
 
+# ReAct Agent PoC（需先构建 rag_db）
+python run_rag_retrieval_experiment.py
+python run_react_agent_poc.py --stock 09988.HK              # 需 LLM_API_KEY
+python run_react_agent_poc.py --offline --stock 09988.HK    # 离线验证工具链
+
 # 启动 API 服务（需 pip install fastapi uvicorn）
 python main.py
 ```
@@ -90,7 +98,19 @@ python main.py
 
 **输出指标**：Top-1 Accuracy、Top-5 Recall、MRR、NDCG@5、Avg. Retrieval Latency
 
-### C. 在线测试框架
+### C. ReAct Agent（Sentinel PoC）
+
+`run_react_agent_poc.py` 演示 **推理 → 工具 → 再推理** 闭环，工具直接复用 RAG 向量库：
+
+| 工具 | 作用 |
+|------|------|
+| `search_financial_news` | 语义检索 `rag_db` 中的新闻/公告 |
+| `summarize_stock_news` | 按主题聚合多只相关片段 |
+| `get_stock_price` | yfinance 拉取最新行情 |
+
+架构：`LangGraph create_react_agent` + `ChatOpenAI(DeepSeek)` + 上述工具 → JSON 风险结论。
+
+### D. 在线测试框架
 
 `data_stream_sampler` → `OnlineTestingFramework` → `ShadowTestingEnvironment` → `EvaluationEngine` → `FeedbackController`
 
@@ -111,7 +131,7 @@ python main.py
 |--------|------|
 | `preprocessor.py` / `analyzer.py` | 由 `multilingual_*` 替代 |
 | `demo_enhanced_embedding.py` | 逻辑已并入 `vector_storage.py` |
-| `agent/`、`tools/financial_tools.py` | 未接入主流程的占位代码 |
+| 旧版空壳 `agent/` 占位 | 已替换为可运行 PoC（`run_react_agent_poc.py`） |
 | `evaluation/run_evaluation.py` | 接口过时；RAG 评估用 `run_rag_retrieval_experiment.py` |
 | 多份重复 Markdown 指南 | 内容合并进本 README |
 
