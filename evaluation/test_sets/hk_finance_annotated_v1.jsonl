@@ -1,0 +1,2 @@
+{"query": "腾讯 监管调查", "stock_code": "00700.HK", "relevant_ids": ["doc_abc123", "doc_def456"], "annotator": "human", "relevance_scores": {"doc_abc123": 3, "doc_def456": 2}}
+{"query": "Alibaba earnings miss", "stock_code": "09988.HK", "relevant_ids": ["doc_ghi789"], "annotator": "human", "relevance_scores": {"doc_ghi789": 3}}

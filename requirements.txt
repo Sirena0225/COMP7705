@@ -13,6 +13,10 @@ requests>=2.31.0              # HTTP 请求
 jieba>=0.42.1                 # 中文分词
 nltk>=3.8.0                   # 英文处理
 langdetect>=1.0.9             # 语言检测
+langchain>=0.1.0
+langchain-core>=0.1.0
+langgraph>=0.0.20
+yfinance>=0.2.35
 
 # -------- 数据处理和存储 --------
 pandas>=2.0.0                 # 数据处理和分析

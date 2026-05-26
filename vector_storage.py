@@ -11,6 +11,7 @@ import json
 import chromadb
 from chromadb.config import Settings
 import openai
+import langdetect
 
 
 class VectorStore:
@@ -22,9 +23,11 @@ class VectorStore:
     def __init__(self, 
                  collection_name: str = "hk_stock_news",
                  persist_directory: str = "./chroma_db",
-                 embedding_model: str = "text-embedding-3-small"):
+                 embedding_model: str = "text-embedding-3-small",
+                 use_enhanced_embedding: bool = False):
         
         self.embedding_model = embedding_model
+        self.use_enhanced_embedding = use_enhanced_embedding
         self.api_key = os.getenv("OPENAI_API_KEY")
         
         # 初始化ChromaDB客户端
@@ -53,6 +56,69 @@ class VectorStore:
         )
         return response.data[0].embedding
     
+    def _get_embedding_enhanced(self, text: str) -> List[float]:
+        """
+        多语言感知的嵌入策略 - 支持混合ZH/EN金融文本
+        
+        功能：
+        - 自动检测文本语言（中文/英文/混合）
+        - 为中文文本使用大模型以获得更好的CJK覆盖
+        - 为英文文本使用小模型以降低成本
+        - 为混合文本使用大模型并添加明确标记
+        
+        输入：文本内容
+        输出：优化的向量嵌入
+        """
+        # 截断长文本
+        text = text[:8000] if len(text) > 8000 else text
+        
+        # Step 1: 语言检测（带降级处理）
+        try:
+            lang = langdetect.detect(text)
+        except Exception as e:
+            # 若检测失败，默认为未知语言，使用大模型
+            lang = "unknown"
+            print(f"⚠️ 语言检测失败: {str(e)}, 使用默认策略")
+        
+        # Step 2: 策略选择
+        if lang in ["zh-cn", "zh-tw", "zh"]:
+            # 中文为主：使用大模型以获得更好的CJK支持
+            embedding_model = "text-embedding-3-large"
+            processed_text = f"[ZH] {text}"
+            language_tag = "Chinese"
+        elif lang == "en":
+            # 英文：使用小模型以降低成本
+            embedding_model = "text-embedding-3-small"
+            processed_text = text
+            language_tag = "English"
+        else:
+            # 混合/未知语言：使用大模型并添加混合标记
+            embedding_model = "text-embedding-3-large"
+            processed_text = f"[MIXED] {text}"
+            language_tag = "Mixed/Unknown"
+        
+        # Step 3: 调用API获取嵌入
+        try:
+            response = self.embed_client.embeddings.create(
+                input=[processed_text],
+                model=embedding_model
+            )
+            embedding = response.data[0].embedding
+            
+            # 记录使用的策略
+            print(f"✅ 嵌入生成: 语言={language_tag}, 模型={embedding_model}, "
+                  f"文本长度={len(text)}, 向量维度={len(embedding)}")
+            
+            return embedding
+        except Exception as e:
+            print(f"❌ 嵌入生成失败: {str(e)}, 使用标准模型降级")
+            # 降级处理：使用标准模型
+            response = self.embed_client.embeddings.create(
+                model=self.embedding_model,
+                input=text
+            )
+            return response.data[0].embedding
+    
     def add_text(self, 
                  text_id: str,
                  content: str,
@@ -74,7 +140,12 @@ class VectorStore:
         
         # 计算embedding
         if embedding is None:
-            embedding = self._get_embedding(content)
+            if self.use_enhanced_embedding:
+                # 使用多语言感知的增强嵌入
+                embedding = self._get_embedding_enhanced(content)
+            else:
+                # 使用标准嵌入
+                embedding = self._get_embedding(content)
         
         # 添加到集合
         self.collection.add(
