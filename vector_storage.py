@@ -4,32 +4,21 @@
 """
 
 import os
-from typing import List, Dict, Any, Optional, Union
+import math
+import re
+import time
 import hashlib
 import json
+from collections import Counter, defaultdict
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+from dateutil.parser import parse
 
 import chromadb
-import openai
+from chromadb.config import Settings
+import jieba
 import langdetect
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# 阿里云百炼 DashScope OpenAI 兼容 Embedding 端点
-DASHSCOPE_BASE_URL_CN = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DASHSCOPE_BASE_URL_INTL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-DASHSCOPE_DEFAULT_EMBEDDING_MODEL = "text-embedding-v3"
-
-
-def _default_dashscope_base_url() -> str:
-    """根据 DASHSCOPE_REGION 选择地域端点（cn=北京，intl=新加坡，默认 intl）。"""
-    explicit = os.getenv("DASHSCOPE_BASE_URL")
-    if explicit:
-        return explicit
-    region = os.getenv("DASHSCOPE_REGION", "intl").lower()
-    if region in ("cn", "beijing", "china"):
-        return DASHSCOPE_BASE_URL_CN
-    return DASHSCOPE_BASE_URL_INTL
+import openai
 
 
 class VectorStore:
@@ -41,140 +30,46 @@ class VectorStore:
     def __init__(self, 
                  collection_name: str = "hk_stock_news",
                  persist_directory: str = "./chroma_db",
-                 embedding_model: Optional[str] = None,
+                 embedding_model: str = "text-embedding-3-small",
                  use_enhanced_embedding: bool = False,
-                 embedding_backend: Optional[str] = None):
+                 use_hybrid_retrieval: bool = True):
         
+        self.embedding_model = embedding_model
         self.use_enhanced_embedding = use_enhanced_embedding
-        self.embedding_backend = (
-            embedding_backend or os.getenv("EMBEDDING_BACKEND", "dashscope")
-        )
-        self._local_model = None
-        self.embed_client: Optional[openai.OpenAI] = None
-        self.embedding_dimensions = self._parse_embedding_dimensions()
-        self._setup_embedding_client(embedding_model)
+        self.use_hybrid_retrieval = use_hybrid_retrieval
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        self._doc_store: Dict[str, Dict[str, Any]] = {}
+        self._bm25_index_built = False
+        self._bm25_doc_freq: Counter = Counter()
+        self._bm25_doc_term_freqs: Dict[str, Counter] = {}
+        self._bm25_doc_lengths: Dict[str, int] = {}
+        self._bm25_avgdl: float = 0.0
         
-        # 确保持久化目录存在
-        os.makedirs(persist_directory, exist_ok=True)
-
-        # ChromaDB 1.x：使用 PersistentClient 替代已废弃的 Client(Settings(chroma_db_impl=...))
-        self.client = chromadb.PersistentClient(path=persist_directory)
+        # 初始化ChromaDB客户端
+        self.client = chromadb.Client(Settings(
+            chroma_db_impl="duckdb+parquet",
+            persist_directory=persist_directory
+        ))
         
-        # 获取或创建集合，使用 metadata 保存语义搜索配置
+        # 获取或创建集合
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
-            metadata={"hnsw:space": "cosine"}
+            metadata={"hnsw:space": "cosine"}  # 使用余弦相似度
         )
-
-    @staticmethod
-    def _parse_embedding_dimensions() -> Optional[int]:
-        raw = os.getenv("EMBEDDING_DIMENSIONS")
-        if not raw:
-            return 1024
-        try:
-            return int(raw)
-        except ValueError:
-            return 1024
-
-    def _setup_embedding_client(self, embedding_model: Optional[str]) -> None:
-        """按 backend 初始化嵌入客户端与默认模型。"""
-        backend = self.embedding_backend
-
-        if backend == "auto":
-            if os.getenv("DASHSCOPE_API_KEY"):
-                backend = "dashscope"
-            elif os.getenv("OPENAI_API_KEY"):
-                backend = "openai"
-            else:
-                backend = "local"
-            self.embedding_backend = backend
-
-        if backend == "dashscope":
-            api_key = os.getenv("DASHSCOPE_API_KEY")
-            if not api_key:
-                raise ValueError(
-                    "未设置 DASHSCOPE_API_KEY，请在 .env 中配置阿里云百炼 API Key"
-                )
-            base_url = _default_dashscope_base_url()
-            self.embed_client = openai.OpenAI(api_key=api_key, base_url=base_url)
-            self.embedding_model = embedding_model or os.getenv(
-                "EMBEDDING_MODEL", DASHSCOPE_DEFAULT_EMBEDDING_MODEL
-            )
-            return
-
-        if backend == "openai":
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                raise ValueError("未设置 OPENAI_API_KEY")
-            openai_kwargs: Dict[str, Any] = {"api_key": api_key}
-            base_url = os.getenv("OPENAI_BASE_URL")
-            if base_url:
-                openai_kwargs["base_url"] = base_url
-            self.embed_client = openai.OpenAI(**openai_kwargs)
-            self.embedding_model = embedding_model or os.getenv(
-                "EMBEDDING_MODEL", "text-embedding-3-small"
-            )
-            return
-
-        if backend == "local":
-            self.embedding_model = embedding_model or "all-MiniLM-L6-v2"
-            return
-
-        raise ValueError(
-            f"不支持的 EMBEDDING_BACKEND: {backend}，"
-            "可选: dashscope | openai | local | auto"
-        )
-
-    def _create_api_embedding(
-        self, text: Union[str, List[str]], model: Optional[str] = None
-    ) -> List[float]:
-        """调用远程 Embedding API（百炼 / OpenAI 兼容）。"""
-        if self.embed_client is None:
-            raise RuntimeError("远程嵌入客户端未初始化")
-
-        model = model or self.embedding_model
-        payload: Dict[str, Any] = {
-            "model": model,
-            "input": text,
-            "encoding_format": "float",
-        }
-        if self.embedding_dimensions and model.startswith("text-embedding-v"):
-            payload["dimensions"] = self.embedding_dimensions
-
-        response = self.embed_client.embeddings.create(**payload)
-        return response.data[0].embedding
+        
+        # 初始化Embedding客户端
+        self.embed_client = openai.OpenAI(api_key=self.api_key)
     
-    def _get_local_model(self):
-        if self._local_model is None:
-            from sentence_transformers import SentenceTransformer
-            self._local_model = SentenceTransformer("all-MiniLM-L6-v2")
-        return self._local_model
-
-    def _get_embedding_local(self, text: str) -> List[float]:
-        text = text[:8000] if len(text) > 8000 else text
-        return self._get_local_model().encode(text).tolist()
-
-    def _use_local_backend(self) -> bool:
-        return self.embedding_backend == "local"
-
-    def _fallback_to_local(self, reason: str):
-        if self.embedding_backend != "auto":
-            raise RuntimeError(reason)
-        print(f"⚠️  {reason}，切换为本地嵌入模型 (all-MiniLM-L6-v2)")
-        self.embedding_backend = "local"
-
     def _get_embedding(self, text: str) -> List[float]:
         """获取文本的向量嵌入"""
+        # 截断长文本
         text = text[:8000] if len(text) > 8000 else text
-
-        if self._use_local_backend():
-            return self._get_embedding_local(text)
-
-        try:
-            return self._create_api_embedding(text)
-        except Exception as e:
-            self._fallback_to_local(str(e))
-            return self._get_embedding_local(text)
+        
+        response = self.embed_client.embeddings.create(
+            model=self.embedding_model,
+            input=text
+        )
+        return response.data[0].embedding
     
     def _get_embedding_enhanced(self, text: str) -> List[float]:
         """
@@ -200,27 +95,402 @@ class VectorStore:
             lang = "unknown"
             print(f"⚠️ 语言检测失败: {str(e)}, 使用默认策略")
         
-        # Step 2: 策略选择（百炼统一用 text-embedding-v3，通过前缀区分语言）
+        # Step 2: 策略选择
         if lang in ["zh-cn", "zh-tw", "zh"]:
+            # 中文为主：使用大模型以获得更好的CJK支持
+            embedding_model = "text-embedding-3-large"
             processed_text = f"[ZH] {text}"
             language_tag = "Chinese"
         elif lang == "en":
+            # 英文：使用小模型以降低成本
+            embedding_model = "text-embedding-3-small"
             processed_text = text
             language_tag = "English"
         else:
+            # 混合/未知语言：使用大模型并添加混合标记
+            embedding_model = "text-embedding-3-large"
             processed_text = f"[MIXED] {text}"
             language_tag = "Mixed/Unknown"
-
-        # Step 3: 获取嵌入
-        if self._use_local_backend():
-            return self._get_embedding_local(processed_text)
-
+        
+        # Step 3: 调用API获取嵌入
         try:
-            return self._create_api_embedding(processed_text)
+            response = self.embed_client.embeddings.create(
+                input=[processed_text],
+                model=embedding_model
+            )
+            embedding = response.data[0].embedding
+            
+            # 记录使用的策略
+            print(f"✅ 嵌入生成: 语言={language_tag}, 模型={embedding_model}, "
+                  f"文本长度={len(text)}, 向量维度={len(embedding)}")
+            
+            return embedding
         except Exception as e:
-            self._fallback_to_local(f"增强嵌入 API 失败: {e}")
-            return self._get_embedding_local(processed_text)
+            print(f"❌ 嵌入生成失败: {str(e)}, 使用标准模型降级")
+            # 降级处理：使用标准模型
+            response = self.embed_client.embeddings.create(
+                model=self.embedding_model,
+                input=text
+            )
+            return response.data[0].embedding
+
+    def _detect_language(self, text: str) -> str:
+        try:
+            return langdetect.detect(text)
+        except Exception:
+            return "unknown"
     
+    def _normalize_date(self, value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        try:
+            return parse(value)
+        except Exception:
+            return None
+    
+    def _tokenize_for_bm25(self, text: str) -> List[str]:
+        if not text:
+            return []
+
+        tokens = []
+        fragments = re.findall(r"[\u4e00-\u9fff]+|[A-Za-z0-9_]+", text.lower())
+        for fragment in fragments:
+            if re.search(r"[\u4e00-\u9fff]", fragment):
+                tokens.extend([tok for tok in jieba.lcut(fragment) if tok.strip()])
+            else:
+                tokens.append(fragment)
+        return tokens
+    
+    def _load_docs_from_collection(self):
+        if self._doc_store:
+            return
+
+        results = self.collection.get(include=["ids", "documents", "metadatas"])
+        if not results:
+            return
+
+        doc_ids = results.get("ids", [[]])[0]
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+
+        for doc_id, content, metadata in zip(doc_ids, documents, metadatas):
+            self._doc_store[doc_id] = {
+                "content": content,
+                "metadata": metadata or {}
+            }
+    
+    def _build_bm25_index(self):
+        self._load_docs_from_collection()
+        self._bm25_doc_freq = Counter()
+        self._bm25_doc_term_freqs = {}
+        self._bm25_doc_lengths = {}
+
+        for doc_id, doc in self._doc_store.items():
+            tokens = self._tokenize_for_bm25(doc["content"])
+            term_freq = Counter(tokens)
+            self._bm25_doc_term_freqs[doc_id] = term_freq
+            self._bm25_doc_lengths[doc_id] = len(tokens)
+            for term in term_freq:
+                self._bm25_doc_freq[term] += 1
+
+        lengths = list(self._bm25_doc_lengths.values())
+        self._bm25_avgdl = float(sum(lengths)) / len(lengths) if lengths else 0.0
+        self._bm25_index_built = True
+
+    def _ensure_bm25_index(self):
+        if not self._bm25_index_built:
+            self._build_bm25_index()
+
+    def _apply_metadata_filters(
+        self,
+        metadata: Dict[str, Any],
+        stock_code: Optional[str] = None,
+        filter_type: Optional[str] = None,
+        risk_level: Optional[str] = None,
+        sentiment_polarity: Optional[str] = None,
+        min_sentiment: Optional[float] = None,
+        max_sentiment: Optional[float] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> bool:
+        if stock_code and metadata.get("stock_code") != stock_code:
+            return False
+        if filter_type and metadata.get("type") != filter_type:
+            return False
+        if risk_level and metadata.get("risk_level") != risk_level:
+            return False
+        if sentiment_polarity and metadata.get("polarity") != sentiment_polarity:
+            return False
+        sentiment_score = metadata.get("sentiment_score")
+        if min_sentiment is not None:
+            if sentiment_score is None or float(sentiment_score) < min_sentiment:
+                return False
+        if max_sentiment is not None:
+            if sentiment_score is None or float(sentiment_score) > max_sentiment:
+                return False
+
+        created_at = metadata.get("created_at") or metadata.get("publish_time")
+        created_at_dt = self._normalize_date(created_at)
+        if start_date:
+            start_dt = self._normalize_date(start_date)
+            if start_dt and (not created_at_dt or created_at_dt < start_dt):
+                return False
+        if end_date:
+            end_dt = self._normalize_date(end_date)
+            if end_dt and (not created_at_dt or created_at_dt > end_dt):
+                return False
+
+        return True
+    
+    def _filter_doc_ids(
+        self,
+        stock_code: Optional[str] = None,
+        filter_type: Optional[str] = None,
+        risk_level: Optional[str] = None,
+        sentiment_polarity: Optional[str] = None,
+        min_sentiment: Optional[float] = None,
+        max_sentiment: Optional[float] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> List[str]:
+        self._load_docs_from_collection()
+        filtered = []
+        for doc_id, doc in self._doc_store.items():
+            if self._apply_metadata_filters(
+                doc["metadata"],
+                stock_code=stock_code,
+                filter_type=filter_type,
+                risk_level=risk_level,
+                sentiment_polarity=sentiment_polarity,
+                min_sentiment=min_sentiment,
+                max_sentiment=max_sentiment,
+                start_date=start_date,
+                end_date=end_date,
+            ):
+                filtered.append(doc_id)
+        return filtered
+    
+    def _bm25_scores(
+        self,
+        query: str,
+        candidate_ids: Optional[List[str]] = None,
+        top_k: int = 20,
+    ) -> List[Dict[str, Any]]:
+        self._ensure_bm25_index()
+        query_tokens = self._tokenize_for_bm25(query)
+        if not query_tokens:
+            return []
+
+        N = len(self._bm25_doc_term_freqs)
+        if N == 0:
+            return []
+
+        k1 = 1.5
+        b = 0.75
+        scores = {}
+        candidate_ids = candidate_ids or list(self._bm25_doc_term_freqs.keys())
+
+        for doc_id in candidate_ids:
+            term_freq = self._bm25_doc_term_freqs.get(doc_id, Counter())
+            doc_len = self._bm25_doc_lengths.get(doc_id, 0)
+            if doc_len == 0:
+                continue
+
+            score = 0.0
+            for term in set(query_tokens):
+                if term not in term_freq or term not in self._bm25_doc_freq:
+                    continue
+                df = self._bm25_doc_freq[term]
+                idf = math.log(max(1.0, (N - df + 0.5) / (df + 0.5)) + 1)
+                freq = term_freq[term]
+                denom = freq + k1 * (1 - b + b * doc_len / self._bm25_avgdl)
+                score += idf * freq * (k1 + 1) / denom
+            if score > 0:
+                scores[doc_id] = score
+
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        return [
+            {
+                "id": doc_id,
+                "bm25_score": score,
+                "content": self._doc_store[doc_id]["content"],
+                "metadata": self._doc_store[doc_id]["metadata"]
+            }
+            for doc_id, score in ranked
+            if doc_id in self._doc_store
+        ]
+    
+    def search_dense(
+        self,
+        query: str,
+        stock_code: Optional[str] = None,
+        filter_type: Optional[str] = None,
+        risk_level: Optional[str] = None,
+        sentiment_polarity: Optional[str] = None,
+        min_sentiment: Optional[float] = None,
+        max_sentiment: Optional[float] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        n_results: int = 5,
+        use_enhanced_query_embedding: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        if use_enhanced_query_embedding is None:
+            use_enhanced_query_embedding = self.use_enhanced_embedding
+
+        if use_enhanced_query_embedding:
+            query_embedding = self._get_embedding_enhanced(query)
+        else:
+            query_embedding = self._get_embedding(query)
+
+        where_clause = {}
+        if stock_code:
+            where_clause["stock_code"] = stock_code
+        if filter_type:
+            where_clause["type"] = filter_type
+
+        candidate_limit = max(n_results * 5, 50)
+        results = self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=candidate_limit,
+            where=where_clause if where_clause else None,
+            include=["ids", "documents", "metadatas", "distances"]
+        )
+
+        formatted_results = []
+        ids = results.get("ids", [[]])[0]
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        for i, doc_id in enumerate(ids):
+            metadata = metadatas[i] if i < len(metadatas) else {}
+            if not self._apply_metadata_filters(
+                metadata,
+                stock_code=stock_code,
+                filter_type=filter_type,
+                risk_level=risk_level,
+                sentiment_polarity=sentiment_polarity,
+                min_sentiment=min_sentiment,
+                max_sentiment=max_sentiment,
+                start_date=start_date,
+                end_date=end_date,
+            ):
+                continue
+
+            similarity_score = 1 - distances[i] if i < len(distances) else 0.0
+            formatted_results.append({
+                "id": doc_id,
+                "content": documents[i] if i < len(documents) else "",
+                "metadata": metadata,
+                "similarity_score": similarity_score
+            })
+            if len(formatted_results) >= n_results:
+                break
+
+        return formatted_results
+    
+    def search_bm25(
+        self,
+        query: str,
+        stock_code: Optional[str] = None,
+        filter_type: Optional[str] = None,
+        risk_level: Optional[str] = None,
+        sentiment_polarity: Optional[str] = None,
+        min_sentiment: Optional[float] = None,
+        max_sentiment: Optional[float] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        n_results: int = 5,
+    ) -> List[Dict[str, Any]]:
+        candidate_ids = self._filter_doc_ids(
+            stock_code=stock_code,
+            filter_type=filter_type,
+            risk_level=risk_level,
+            sentiment_polarity=sentiment_polarity,
+            min_sentiment=min_sentiment,
+            max_sentiment=max_sentiment,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return self._bm25_scores(query, candidate_ids=candidate_ids, top_k=n_results)
+    
+    def search_hybrid(
+        self,
+        query: str,
+        stock_code: Optional[str] = None,
+        filter_type: Optional[str] = None,
+        risk_level: Optional[str] = None,
+        sentiment_polarity: Optional[str] = None,
+        min_sentiment: Optional[float] = None,
+        max_sentiment: Optional[float] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        n_results: int = 5,
+        use_enhanced_query_embedding: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        dense_results = self.search_dense(
+            query=query,
+            stock_code=stock_code,
+            filter_type=filter_type,
+            risk_level=risk_level,
+            sentiment_polarity=sentiment_polarity,
+            min_sentiment=min_sentiment,
+            max_sentiment=max_sentiment,
+            start_date=start_date,
+            end_date=end_date,
+            n_results=max(n_results * 2, 20),
+            use_enhanced_query_embedding=use_enhanced_query_embedding,
+        )
+        bm25_results = self.search_bm25(
+            query=query,
+            stock_code=stock_code,
+            filter_type=filter_type,
+            risk_level=risk_level,
+            sentiment_polarity=sentiment_polarity,
+            min_sentiment=min_sentiment,
+            max_sentiment=max_sentiment,
+            start_date=start_date,
+            end_date=end_date,
+            n_results=max(n_results * 2, 20),
+        )
+
+        combined_scores: Dict[str, float] = defaultdict(float)
+        rank_constant = 60.0
+
+        for rank, result in enumerate(dense_results, 1):
+            combined_scores[result["id"]] += 1.0 / (rank_constant + rank)
+        for rank, result in enumerate(bm25_results, 1):
+            combined_scores[result["id"]] += 1.0 / (rank_constant + rank)
+
+        ranked_ids = sorted(
+            combined_scores.items(), key=lambda item: item[1], reverse=True
+        )[:n_results]
+
+        hybrid_results = []
+        for doc_id, score in ranked_ids:
+            if doc_id in self._doc_store:
+                doc = self._doc_store[doc_id]
+                hybrid_results.append({
+                    "id": doc_id,
+                    "content": doc["content"],
+                    "metadata": doc["metadata"],
+                    "hybrid_score": score
+                })
+            else:
+                hit = self.collection.get(ids=[doc_id], include=["documents", "metadatas"])
+                doc_content = hit.get("documents", [[]])[0][0] if hit.get("documents") else ""
+                doc_metadata = hit.get("metadatas", [[]])[0][0] if hit.get("metadatas") else {}
+                hybrid_results.append({
+                    "id": doc_id,
+                    "content": doc_content,
+                    "metadata": doc_metadata,
+                    "hybrid_score": score
+                })
+
+        return hybrid_results
+
     def add_text(self, 
                  text_id: str,
                  content: str,
@@ -347,11 +617,20 @@ class VectorStore:
         
         return added_ids
     
-    def search(self, 
-               query: str, 
-               stock_code: Optional[str] = None,
-               filter_type: Optional[str] = None,
-               n_results: int = 5) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        stock_code: Optional[str] = None,
+        filter_type: Optional[str] = None,
+        n_results: int = 5,
+        risk_level: Optional[str] = None,
+        sentiment_polarity: Optional[str] = None,
+        min_sentiment: Optional[float] = None,
+        max_sentiment: Optional[float] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        use_hybrid: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
         """
         语义检索
         
@@ -360,41 +639,43 @@ class VectorStore:
             stock_code: 可选，限制特定股票
             filter_type: 可选，限制文档类型（original_text/sentiment_analysis/risk_alert）
             n_results: 返回结果数量
+            risk_level: 可选，限制风险等级
+            sentiment_polarity: 可选，限制情绪极性
+            min_sentiment/max_sentiment: 可选，情绪分数范围过滤
+            start_date/end_date: 可选，时间范围过滤
+            use_hybrid: 是否启用混合检索（BM25 + semantic）
         
-        输出：匹配文档列表，包含内容和相似度分数
+        输出：匹配文档列表，包含内容和分数
         """
-        # 生成查询向量（须与入库时相同的嵌入策略，避免维度不一致）
-        if self.use_enhanced_embedding:
-            query_embedding = self._get_embedding_enhanced(query)
-        else:
-            query_embedding = self._get_embedding(query)
-        
-        # 构建过滤条件
-        where_clause = {}
-        if stock_code:
-            where_clause["stock_code"] = stock_code
-        if filter_type:
-            where_clause["type"] = filter_type
-        
-        # 执行检索
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
+        if use_hybrid is None:
+            use_hybrid = self.use_hybrid_retrieval
+
+        if use_hybrid:
+            return self.search_hybrid(
+                query=query,
+                stock_code=stock_code,
+                filter_type=filter_type,
+                risk_level=risk_level,
+                sentiment_polarity=sentiment_polarity,
+                min_sentiment=min_sentiment,
+                max_sentiment=max_sentiment,
+                start_date=start_date,
+                end_date=end_date,
+                n_results=n_results,
+            )
+
+        return self.search_dense(
+            query=query,
+            stock_code=stock_code,
+            filter_type=filter_type,
+            risk_level=risk_level,
+            sentiment_polarity=sentiment_polarity,
+            min_sentiment=min_sentiment,
+            max_sentiment=max_sentiment,
+            start_date=start_date,
+            end_date=end_date,
             n_results=n_results,
-            where=where_clause if where_clause else None,
-            include=["documents", "metadatas", "distances"]
         )
-        
-        # 格式化输出
-        formatted_results = []
-        for i in range(len(results['ids'][0])):
-            formatted_results.append({
-                "id": results['ids'][0][i],
-                "content": results['documents'][0][i],
-                "metadata": results['metadatas'][0][i],
-                "similarity_score": 1 - results['distances'][0][i]  # 距离转相似度
-            })
-        
-        return formatted_results
     
     def search_risks(self, stock_code: str, days: int = 30) -> List[Dict[str, Any]]:
         """
