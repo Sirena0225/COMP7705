@@ -93,6 +93,7 @@ class VectorStore:
 
         self.hf_tokenizer = None
         self.hf_model = None
+        self.hf_model_name: Optional[str] = None
         self.hf_device = torch.device('cuda' if torch is not None and torch.cuda.is_available() else 'cpu') if torch is not None else None
         self._doc_store: Dict[str, Dict[str, Any]] = {}
         self._bm25_index_built = False
@@ -100,6 +101,15 @@ class VectorStore:
         self._bm25_doc_term_freqs: Dict[str, Counter] = {}
         self._bm25_doc_lengths: Dict[str, int] = {}
         self._bm25_avgdl: float = 0.0
+        self.hybrid_dense_weight: float = float(os.getenv('HYBRID_DENSE_WEIGHT', '0.5'))
+        self.hybrid_bm25_weight: float = float(os.getenv('HYBRID_BM25_WEIGHT', '0.5'))
+        if self.hybrid_dense_weight < 0:
+            self.hybrid_dense_weight = 0.0
+        if self.hybrid_bm25_weight < 0:
+            self.hybrid_bm25_weight = 0.0
+        if self.hybrid_dense_weight + self.hybrid_bm25_weight == 0:
+            self.hybrid_dense_weight = 0.5
+            self.hybrid_bm25_weight = 0.5
         
         # 初始化ChromaDB客户端
         self.client = chromadb.Client(Settings(
@@ -230,21 +240,24 @@ class VectorStore:
         model = SentenceTransformer('all-MiniLM-L6-v2')
         return model.encode(text, convert_to_numpy=True).tolist()
 
-    def _load_hf_model(self):
+    def _load_hf_model(self, model_name: Optional[str] = None):
         if AutoTokenizer is None or AutoModel is None or torch is None:
             raise RuntimeError('transformers 或 torch 未安装，无法使用 HuggingFace embedding')
 
-        if self.hf_tokenizer is None or self.hf_model is None:
-            print(f'⚙️ 加载 HuggingFace 模型 {self.embedding_model} 到 {self.hf_device}')
-            self.hf_tokenizer = AutoTokenizer.from_pretrained(self.embedding_model)
-            self.hf_model = AutoModel.from_pretrained(self.embedding_model).to(self.hf_device)
+        model_name = model_name or self.embedding_model
+        if self.hf_model_name != model_name or self.hf_tokenizer is None or self.hf_model is None:
+            print(f'⚙️ 加载 HuggingFace 模型 {model_name} 到 {self.hf_device}')
+            self.hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.hf_model = AutoModel.from_pretrained(model_name).to(self.hf_device)
             self.hf_model.eval()
+            self.hf_model_name = model_name
 
         return self.hf_tokenizer, self.hf_model
 
-    def _get_hf_embedding(self, text: str) -> List[float]:
+    def _get_hf_embedding(self, text: str, model_override: Optional[str] = None) -> List[float]:
+        model_name = model_override or self.embedding_model
+        tokenizer, model = self._load_hf_model(model_name)
         """使用 HuggingFace 模型生成嵌入向量"""
-        tokenizer, model = self._load_hf_model()
         inputs = tokenizer(
             text,
             return_tensors='pt',
@@ -280,7 +293,22 @@ class VectorStore:
         多语言感知的嵌入策略 - 支持混合ZH/EN金融文本
         """
         if self.embedding_backend == 'hf':
-            return self._get_hf_embedding(text)
+            try:
+                lang = langdetect.detect(text)
+            except Exception as e:
+                lang = "unknown"
+                print(f"⚠️ 语言检测失败: {str(e)}, 使用默认HF模型")
+
+            if lang in ["zh-cn", "zh-tw", "zh"]:
+                hf_model = os.getenv('HF_CHINESE_EMBEDDING_MODEL', 'Qwen/Qwen3-Embedding-4B')
+                language_tag = "Chinese"
+            else:
+                hf_model = os.getenv('HF_EMBEDDING_MODEL', self.embedding_model)
+                language_tag = "English"
+
+            embedding = self._get_hf_embedding(text, model_override=hf_model)
+            print(f"✅ 嵌入生成: 语言={language_tag}, 模型={hf_model}, 文本长度={len(text)}, 向量维度={len(embedding)}")
+            return embedding
 
         if not self.api_key:
             # 本地 fallback 时不使用 OpenAI 增强策略
@@ -368,9 +396,12 @@ class VectorStore:
                 tokens.append(fragment)
         return tokens
     
-    def _load_docs_from_collection(self):
-        if self._doc_store:
+    def _load_docs_from_collection(self, force_reload: bool = False):
+        if self._doc_store and not force_reload:
             return
+
+        if force_reload:
+            self._doc_store = {}
 
         results = self.collection.get(include=["documents", "metadatas"])
         if not results:
@@ -387,7 +418,7 @@ class VectorStore:
             }
     
     def _build_bm25_index(self):
-        self._load_docs_from_collection()
+        self._load_docs_from_collection(force_reload=True)
         self._bm25_doc_freq = Counter()
         self._bm25_doc_term_freqs = {}
         self._bm25_doc_lengths = {}
@@ -661,39 +692,61 @@ class VectorStore:
             n_results=max(n_results * 2, 20),
         )
 
-        combined_scores: Dict[str, float] = defaultdict(float)
-        rank_constant = 60.0
-
+        # Build a candidate set from both dense and BM25 results
+        candidate_map: Dict[str, Dict[str, Any]] = {}
         for rank, result in enumerate(dense_results, 1):
-            combined_scores[result["id"]] += 1.0 / (rank_constant + rank)
-        for rank, result in enumerate(bm25_results, 1):
-            combined_scores[result["id"]] += 1.0 / (rank_constant + rank)
+            candidate_map[result["id"]] = {
+                "content": result["content"],
+                "metadata": result["metadata"],
+                "dense_score": result.get("similarity_score", 0.0),
+                "bm25_score": 0.0,
+                "dense_rank": rank,
+                "bm25_rank": None,
+            }
 
-        ranked_ids = sorted(
-            combined_scores.items(), key=lambda item: item[1], reverse=True
-        )[:n_results]
+        for rank, result in enumerate(bm25_results, 1):
+            if result["id"] in candidate_map:
+                candidate_map[result["id"]]["bm25_score"] = result.get("bm25_score", 0.0)
+                candidate_map[result["id"]]["bm25_rank"] = rank
+            else:
+                candidate_map[result["id"]] = {
+                    "content": result["content"],
+                    "metadata": result["metadata"],
+                    "dense_score": 0.0,
+                    "bm25_score": result.get("bm25_score", 0.0),
+                    "dense_rank": None,
+                    "bm25_rank": rank,
+                }
+
+        if not candidate_map:
+            return []
+
+        # Normalize scores to [0,1] for effective fusion
+        max_dense = max((item["dense_score"] for item in candidate_map.values()), default=1.0)
+        max_bm25 = max((item["bm25_score"] for item in candidate_map.values()), default=1.0)
+        max_dense = max_dense if max_dense > 0 else 1.0
+        max_bm25 = max_bm25 if max_bm25 > 0 else 1.0
 
         hybrid_results = []
-        for doc_id, score in ranked_ids:
-            if doc_id in self._doc_store:
-                doc = self._doc_store[doc_id]
-                hybrid_results.append({
-                    "id": doc_id,
-                    "content": doc["content"],
-                    "metadata": doc["metadata"],
-                    "hybrid_score": score
-                })
-            else:
-                hit = self.collection.get(ids=[doc_id], include=["documents", "metadatas"])
-                doc_content = hit.get("documents", [[]])[0][0] if hit.get("documents") else ""
-                doc_metadata = hit.get("metadatas", [[]])[0][0] if hit.get("metadatas") else {}
-                hybrid_results.append({
-                    "id": doc_id,
-                    "content": doc_content,
-                    "metadata": doc_metadata,
-                    "hybrid_score": score
-                })
+        for doc_id, item in candidate_map.items():
+            dense_norm = item["dense_score"] / max_dense if item["dense_score"] else 0.0
+            bm25_norm = item["bm25_score"] / max_bm25 if item["bm25_score"] else 0.0
+            hybrid_score = (
+                self.hybrid_dense_weight * dense_norm +
+                self.hybrid_bm25_weight * bm25_norm
+            )
+            hybrid_results.append({
+                "id": doc_id,
+                "content": item["content"],
+                "metadata": item["metadata"],
+                "hybrid_score": hybrid_score,
+                "dense_score": item["dense_score"],
+                "bm25_score": item["bm25_score"],
+                "dense_rank": item["dense_rank"],
+                "bm25_rank": item["bm25_rank"],
+            })
 
+        hybrid_results = sorted(hybrid_results, key=lambda x: x["hybrid_score"], reverse=True)[:n_results]
         return hybrid_results
 
     def add_text(self,
@@ -729,16 +782,25 @@ class VectorStore:
                 # 本地fallback embedding
                 embedding = self._get_local_embedding(content)
         
+        doc_metadata = {
+            "text_id": text_id,
+            "content_preview": content[:200],
+            **metadata
+        }
+        self._doc_store[doc_id] = {
+            "content": content,
+            "metadata": doc_metadata
+        }
+
+        # 重新构建 BM25 索引以包含新文档
+        self._bm25_index_built = False
+
         # 添加到集合
         self.collection.add(
             ids=[doc_id],
             embeddings=[embedding],
             documents=[content],
-            metadatas=[{
-                "text_id": text_id,
-                "content_preview": content[:200],
-                **metadata
-            }]
+            metadatas=[doc_metadata]
         )
         
         return doc_id

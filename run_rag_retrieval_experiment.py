@@ -3,6 +3,7 @@ RAG 检索精度完整实验脚本
 一键运行，无需额外配置
 """
 
+import argparse
 import json
 import os
 import time
@@ -50,20 +51,22 @@ class RAGExperiment:
         print(f"  • 来源类型: {dict(sources)}")
         print(f"  • 语言分布: {dict(languages)}")
     
-    def build_vector_store(self, use_enhanced=True):
+    def build_vector_store(self, use_enhanced=True, use_hybrid=True):
         """构建向量库"""
         print("\n" + "="*70)
         print("🔨 步骤2: 构建向量库")
         print("="*70)
         
         embedding_mode = "增强模式" if use_enhanced else "标准模式"
-        print(f"\n使用 {embedding_mode} (use_enhanced_embedding={use_enhanced})")
+        hybrid_mode = "混合检索" if use_hybrid else "纯语义检索"
+        print(f"\n使用 {embedding_mode} (use_enhanced_embedding={use_enhanced}), {hybrid_mode} (use_hybrid_retrieval={use_hybrid})")
         
         self.vector_store = VectorStore(
             collection_name="rag_retrieval_eval",
             persist_directory="./rag_db_eval",
             embedding_model=os.getenv('EMBEDDING_MODEL', 'text-embedding-v3'),
             use_enhanced_embedding=use_enhanced,
+            use_hybrid_retrieval=use_hybrid,
         )
         backend = self.vector_store.embedding_backend
         if backend == "dashscope":
@@ -195,6 +198,7 @@ class RAGExperiment:
         print(f"  • 测试查询数: {len(self.test_queries)}")
         print(f"  • 向量库构建时间: {self.results.get('build_time', 0):.2f}s")
         print(f"  • 评估时间: {self.results.get('eval_time', 0):.2f}s")
+        print(f"  • 检索模式: {'混合检索' if self.vector_store.use_hybrid_retrieval else '纯语义检索'}")
         
         metrics = self.results.get('metrics', {})
         
@@ -241,6 +245,8 @@ class RAGExperiment:
                 'data_source': self.data_path,
                 'embedding_backend': self.vector_store.embedding_backend,
                 'embedding_model': self.vector_store.embedding_model,
+                'use_hybrid_retrieval': self.vector_store.use_hybrid_retrieval,
+                'use_enhanced_embedding': self.vector_store.use_enhanced_embedding,
             },
             'timing': {
                 'build_time_seconds': self.results.get('build_time', 0),
@@ -264,7 +270,7 @@ class RAGExperiment:
         
         print(f"\n✅ 结果已保存到: {filename}")
     
-    def run_complete_experiment(self, use_enhanced=True):
+    def run_complete_experiment(self, use_enhanced=True, use_hybrid=True):
         """运行完整实验"""
         print("\n" + "#"*70)
         print("# RAG 检索精度完整实验")
@@ -272,7 +278,7 @@ class RAGExperiment:
         
         # 执行步骤
         self.load_data()
-        self.build_vector_store(use_enhanced=use_enhanced)
+        self.build_vector_store(use_enhanced=use_enhanced, use_hybrid=use_hybrid)
         self.generate_test_queries()
         self.evaluate_retrieval()
         self.display_results()
@@ -285,26 +291,33 @@ class RAGExperiment:
 
 def main():
     """主函数"""
-    
+    parser = argparse.ArgumentParser(description='Run RAG retrieval experiments.')
+    parser.add_argument('--no-hybrid', action='store_true', help='Use pure dense retrieval instead of hybrid dense+BM25.')
+    parser.add_argument('--no-enhanced', action='store_true', help='Disable enhanced embedding and use base embedding only.')
+    args = parser.parse_args()
+
     # 确保数据文件存在
     data_path = 'data/sentiment_input_batch.json'
     if not Path(data_path).exists():
         print(f"❌ 错误: 未找到数据文件 {data_path}")
         print("请确保已正确放置数据文件")
         return
-    
+
     # 创建实验管理器
     experiment = RAGExperiment(data_path=data_path)
-    
+
     # 运行实验
-    experiment.run_complete_experiment(use_enhanced=True)
-    
+    experiment.run_complete_experiment(
+        use_enhanced=not args.no_enhanced,
+        use_hybrid=not args.no_hybrid
+    )
+
     # 可选: 对比实验
     print("\n" + "="*70)
     print("💡 提示: 你也可以禁用增强嵌入进行对比")
     print("="*70)
     print("# experiment = RAGExperiment()")
-    print("# experiment.run_complete_experiment(use_enhanced=False)")
+    print("# experiment.run_complete_experiment(use_enhanced=False, use_hybrid=False)")
 
 
 if __name__ == "__main__":
