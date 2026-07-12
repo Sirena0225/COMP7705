@@ -19,6 +19,20 @@ from chromadb.config import Settings
 import jieba
 import langdetect
 import openai
+import requests
+
+try:
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+except ImportError:
+    torch = None
+    AutoModel = None
+    AutoTokenizer = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
 
 
 class VectorStore:
@@ -37,7 +51,49 @@ class VectorStore:
         self.embedding_model = embedding_model
         self.use_enhanced_embedding = use_enhanced_embedding
         self.use_hybrid_retrieval = use_hybrid_retrieval
-        self.api_key = os.getenv("OPENAI_API_KEY")
+        # 支持多种 LLM 提供方的环境变量名（OpenAI / DashScope / 通用 LLM_API_KEY）
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        self.dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
+        self.llm_api_key = os.getenv("LLM_API_KEY")
+
+        # DashScope base URL（兼容模式）
+        # 优先使用兼容模式专用 URL，避免老旧 API_URL 覆盖可用的兼容端点
+        self.dashscope_api_url = (
+            os.getenv("DASHSCOPE_COMPATIBLE_URL")
+            or os.getenv("DASHSCOPE_API_URL")
+            or os.getenv("DASHSCOPE_BASE_URL")
+        )
+
+        # 允许通过 HF_EMBEDDING_MODEL 指定 HuggingFace 远程/本地 embedding 模型
+        hf_model = os.getenv('HF_EMBEDDING_MODEL')
+        if hf_model:
+            self.embedding_model = hf_model
+
+        # 决定使用哪个嵌入后端：hf > dashscope > openai > local
+        if hf_model or ('/' in str(self.embedding_model) and self.embedding_model.lower().startswith('qwen')):
+            self.embedding_backend = 'hf'
+            self.api_key = None
+        elif self.dashscope_api_url and self.dashscope_api_key:
+            self.embedding_backend = "dashscope"
+            self.api_key = self.dashscope_api_key
+            # DashScope 的兼容模式通常使用独立的 embedding 模型名（如 text-embedding-v4）
+            if str(self.embedding_model).lower().startswith('qwen'):
+                print('⚠️ 注意: qwen 系列通常不直接用于 embeddings，切换为 text-embedding-v4')
+                self.embedding_model = os.getenv('DASHSCOPE_EMBEDDING_MODEL', 'text-embedding-v4')
+        elif self.openai_api_key or self.llm_api_key:
+            self.embedding_backend = "openai"
+            self.api_key = self.openai_api_key or self.llm_api_key
+            # 允许覆盖 OpenAI base URL via env
+            api_base = os.getenv("OPENAI_API_BASE") or os.getenv("DASHSCOPE_API_URL")
+            if api_base:
+                os.environ["OPENAI_API_BASE"] = api_base
+        else:
+            self.embedding_backend = "local"
+            self.api_key = None
+
+        self.hf_tokenizer = None
+        self.hf_model = None
+        self.hf_device = torch.device('cuda' if torch is not None and torch.cuda.is_available() else 'cpu') if torch is not None else None
         self._doc_store: Dict[str, Dict[str, Any]] = {}
         self._bm25_index_built = False
         self._bm25_doc_freq: Counter = Counter()
@@ -47,98 +103,247 @@ class VectorStore:
         
         # 初始化ChromaDB客户端
         self.client = chromadb.Client(Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=persist_directory
+            persist_directory=persist_directory,
+            is_persistent=True
         ))
-        
+
         # 获取或创建集合
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
             metadata={"hnsw:space": "cosine"}  # 使用余弦相似度
         )
-        
-        # 初始化Embedding客户端
-        self.embed_client = openai.OpenAI(api_key=self.api_key)
+
+        # 初始化嵌入客户端（根据之前决定的 embedding_backend）
+        # 不要在这里覆盖 embedding_backend，以便 dashscope 优先级生效
+
+        if self.embedding_backend == "openai":
+            # 初始化OpenAI Embedding客户端
+            self.embed_client = openai.OpenAI(api_key=self.api_key)
+        elif self.embedding_backend == "dashscope":
+            # DashScope 不使用 openai 客户端；保留 api_url 和 key
+            self.embed_client = None
+            print('✅ 使用 DashScope 嵌入后端，URL=', self.dashscope_api_url)
+        elif self.embedding_backend == 'hf':
+            self.embed_client = None
+            print(f'✅ 使用 HuggingFace embedding 后端，模型={self.embedding_model}')
+        elif SentenceTransformer is not None:
+            # 本地回退Embedding客户端
+            self.embed_client = SentenceTransformer('all-MiniLM-L6-v2')
+            print('✅ 使用本地 sentence-transformers 作为嵌入回退方案')
+        else:
+            raise RuntimeError(
+                '缺少 OpenAI API KEY，且 sentence-transformers 未安装，无法生成嵌入。'
+            )
     
     def _get_embedding(self, text: str) -> List[float]:
         """获取文本的向量嵌入"""
         # 截断长文本
         text = text[:8000] if len(text) > 8000 else text
-        
-        response = self.embed_client.embeddings.create(
-            model=self.embedding_model,
-            input=text
-        )
-        return response.data[0].embedding
-    
-    def _get_embedding_enhanced(self, text: str) -> List[float]:
-        """
-        多语言感知的嵌入策略 - 支持混合ZH/EN金融文本
-        
-        功能：
-        - 自动检测文本语言（中文/英文/混合）
-        - 为中文文本使用大模型以获得更好的CJK覆盖
-        - 为英文文本使用小模型以降低成本
-        - 为混合文本使用大模型并添加明确标记
-        
-        输入：文本内容
-        输出：优化的向量嵌入
-        """
-        # 截断长文本
-        text = text[:8000] if len(text) > 8000 else text
-        
-        # Step 1: 语言检测（带降级处理）
-        try:
-            lang = langdetect.detect(text)
-        except Exception as e:
-            # 若检测失败，默认为未知语言，使用大模型
-            lang = "unknown"
-            print(f"⚠️ 语言检测失败: {str(e)}, 使用默认策略")
-        
-        # Step 2: 策略选择
-        if lang in ["zh-cn", "zh-tw", "zh"]:
-            # 中文为主：使用大模型以获得更好的CJK支持
-            embedding_model = "text-embedding-3-large"
-            processed_text = f"[ZH] {text}"
-            language_tag = "Chinese"
-        elif lang == "en":
-            # 英文：使用小模型以降低成本
-            embedding_model = "text-embedding-3-small"
-            processed_text = text
-            language_tag = "English"
-        else:
-            # 混合/未知语言：使用大模型并添加混合标记
-            embedding_model = "text-embedding-3-large"
-            processed_text = f"[MIXED] {text}"
-            language_tag = "Mixed/Unknown"
-        
-        # Step 3: 调用API获取嵌入
-        try:
-            response = self.embed_client.embeddings.create(
-                input=[processed_text],
-                model=embedding_model
-            )
-            embedding = response.data[0].embedding
-            
-            # 记录使用的策略
-            print(f"✅ 嵌入生成: 语言={language_tag}, 模型={embedding_model}, "
-                  f"文本长度={len(text)}, 向量维度={len(embedding)}")
-            
-            return embedding
-        except Exception as e:
-            print(f"❌ 嵌入生成失败: {str(e)}, 使用标准模型降级")
-            # 降级处理：使用标准模型
+
+        # DashScope HTTP 调用
+        if self.embedding_backend == "dashscope":
+            return self._dashscope_get_embedding(text, model=self.embedding_model)
+
+        if self.embedding_backend == 'hf':
+            return self._get_hf_embedding(text)
+
+        # OpenAI 客户端
+        if self.embedding_backend == "openai" and self.embed_client is not None:
             response = self.embed_client.embeddings.create(
                 model=self.embedding_model,
                 input=text
             )
             return response.data[0].embedding
 
-    def _detect_language(self, text: str) -> str:
+        return self._get_local_embedding(text)
+
+    def _dashscope_get_embedding(self, text: str, model: str) -> List[float]:
+        """通过 DashScope 兼容端点生成嵌入（HTTP POST）"""
+        if not self.dashscope_api_url or not self.dashscope_api_key:
+            raise RuntimeError("DashScope endpoint or key not configured")
+
+        base = self.dashscope_api_url.rstrip('/')
+        # 候选路径列表，按优先级尝试
+        candidates = []
+        if '/compatible-mode' in base:
+            # 已经是兼容模式 URL 时，仅需尝试直接 /embeddings
+            candidates.append(base + '/embeddings')
+        else:
+            # 常见 DashScope 兼容路径
+            candidates.extend([
+                base + '/embeddings',
+                base + '/v1/embeddings',
+                base + '/openai/embeddings',
+                base + '/openai/v1/embeddings',
+                base + '/api/v1/embeddings',
+            ])
+
+        headers = {
+            'Authorization': f'Bearer {self.dashscope_api_key}',
+            'Content-Type': 'application/json'
+        }
+        payload = {
+            'model': model,
+            'input': text
+        }
+
+        last_err = None
+        for url in candidates:
+            try:
+                print(f'⚙️ 尝试 DashScope endpoint: {url}')
+                resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            except Exception as e:
+                last_err = e
+                print(f'❌ 请求失败: {url} -> {e}')
+                continue
+
+            if resp.status_code != 200:
+                last_err = RuntimeError(f"{resp.status_code} {resp.text}")
+                print(f'❌ DashScope 响应错误: {url} -> {resp.status_code} {resp.text}')
+                continue
+
+            try:
+                data = resp.json()
+            except Exception as e:
+                last_err = e
+                print(f'❌ JSON 解析失败: {url} -> {e}')
+                continue
+
+            if 'data' in data and isinstance(data['data'], list) and 'embedding' in data['data'][0]:
+                print(f"✅ DashScope 嵌入成功，endpoint={url}")
+                return data['data'][0]['embedding']
+            if 'embedding' in data:
+                print(f"✅ DashScope 嵌入成功，endpoint={url}")
+                return data['embedding']
+
+            last_err = RuntimeError(f'Unexpected DashScope response format from {url}: {data}')
+            print(f'❌ 响应格式不符合预期: {url} -> {data}')
+
+        print(f"❌ DashScope 嵌入全部尝试失败, 最后错误: {last_err}")
+        raise last_err
+
+    def _get_local_embedding(self, text: str) -> List[float]:
+        """使用本地句子嵌入模型生成向量"""
+        if SentenceTransformer is None:
+            raise RuntimeError('sentence-transformers 未安装，无法生成本地嵌入。')
+        # 创建独立的本地模型实例以避免与 OpenAI 客户端冲突
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        return model.encode(text, convert_to_numpy=True).tolist()
+
+    def _load_hf_model(self):
+        if AutoTokenizer is None or AutoModel is None or torch is None:
+            raise RuntimeError('transformers 或 torch 未安装，无法使用 HuggingFace embedding')
+
+        if self.hf_tokenizer is None or self.hf_model is None:
+            print(f'⚙️ 加载 HuggingFace 模型 {self.embedding_model} 到 {self.hf_device}')
+            self.hf_tokenizer = AutoTokenizer.from_pretrained(self.embedding_model)
+            self.hf_model = AutoModel.from_pretrained(self.embedding_model).to(self.hf_device)
+            self.hf_model.eval()
+
+        return self.hf_tokenizer, self.hf_model
+
+    def _get_hf_embedding(self, text: str) -> List[float]:
+        """使用 HuggingFace 模型生成嵌入向量"""
+        tokenizer, model = self._load_hf_model()
+        inputs = tokenizer(
+            text,
+            return_tensors='pt',
+            truncation=True,
+            max_length=2048,
+            padding='longest'
+        )
+        if self.hf_device is not None:
+            inputs = {k: v.to(self.hf_device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        if hasattr(outputs, 'last_hidden_state'):
+            hidden_states = outputs.last_hidden_state
+            attention_mask = inputs.get('attention_mask')
+            if attention_mask is not None:
+                mask = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
+                summed = (hidden_states * mask).sum(dim=1)
+                counts = mask.sum(dim=1).clamp(min=1e-9)
+                embedding = summed / counts
+            else:
+                embedding = hidden_states.mean(dim=1)
+        elif hasattr(outputs, 'pooler_output'):
+            embedding = outputs.pooler_output
+        else:
+            raise RuntimeError('无法从 HuggingFace 模型输出中提取 embedding')
+
+        return embedding[0].cpu().numpy().tolist()
+    
+    def _get_embedding_enhanced(self, text: str) -> List[float]:
+        """
+        多语言感知的嵌入策略 - 支持混合ZH/EN金融文本
+        """
+        if self.embedding_backend == 'hf':
+            return self._get_hf_embedding(text)
+
+        if not self.api_key:
+            # 本地 fallback 时不使用 OpenAI 增强策略
+            return self._get_local_embedding(text)
+
+        # 截断长文本
+        text = text[:8000] if len(text) > 8000 else text
+
+        # Step 1: 语言检测（带降级处理）
         try:
-            return langdetect.detect(text)
-        except Exception:
-            return "unknown"
+            lang = langdetect.detect(text)
+        except Exception as e:
+            lang = "unknown"
+            print(f"⚠️ 语言检测失败: {str(e)}, 使用默认策略")
+
+        # Step 2: 策略选择
+        if self.embedding_backend == 'dashscope':
+            # DashScope 使用兼容的 embedding 模型名，不要使用 OpenAI-only 的 text-embedding-3 系列
+            embedding_model = self.embedding_model
+            processed_text = text
+            language_tag = "DashScope"
+        else:
+            if lang in ["zh-cn", "zh-tw", "zh"]:
+                embedding_model = "text-embedding-3-large"
+                processed_text = f"[ZH] {text}"
+                language_tag = "Chinese"
+            elif lang == "en":
+                embedding_model = "text-embedding-3-small"
+                processed_text = text
+                language_tag = "English"
+            else:
+                embedding_model = "text-embedding-3-large"
+                processed_text = f"[MIXED] {text}"
+                language_tag = "Mixed/Unknown"
+
+        try:
+            # 根据后端选择调用方式
+            if self.embedding_backend == 'dashscope':
+                embedding = self._dashscope_get_embedding(processed_text, model=embedding_model)
+            elif self.embedding_backend == 'hf':
+                embedding = self._get_hf_embedding(processed_text)
+            elif self.embedding_backend == 'openai' and self.embed_client is not None:
+                response = self.embed_client.embeddings.create(
+                    input=[processed_text],
+                    model=embedding_model
+                )
+                embedding = response.data[0].embedding
+            else:
+                return self._get_local_embedding(text)
+
+            print(f"✅ 嵌入生成: 语言={language_tag}, 模型={embedding_model}, "
+                  f"文本长度={len(text)}, 向量维度={len(embedding)}")
+            return embedding
+        except Exception as e:
+            print(f"❌ 嵌入生成失败: {str(e)}, 使用本地模型降级")
+            if self.embedding_backend == 'dashscope' and embedding_model == 'text-embedding-v3':
+                # 如果 DashScope 上 text-embedding-v3 不可用，则尝试 v4
+                print('⚠️ DashScope text-embedding-v3 无法访问，改用 text-embedding-v4 重试')
+                try:
+                    return self._dashscope_get_embedding(processed_text, model='text-embedding-v4')
+                except Exception as inner_e:
+                    print(f'❌ 备用 text-embedding-v4 也失败: {inner_e}')
+            return self._get_local_embedding(text)
     
     def _normalize_date(self, value: Optional[str]) -> Optional[datetime]:
         if not value:
@@ -167,13 +372,13 @@ class VectorStore:
         if self._doc_store:
             return
 
-        results = self.collection.get(include=["ids", "documents", "metadatas"])
+        results = self.collection.get(include=["documents", "metadatas"])
         if not results:
             return
 
-        doc_ids = results.get("ids", [[]])[0]
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
+        doc_ids = results.get("ids", [])
+        documents = results.get("documents", [])
+        metadatas = results.get("metadatas", [])
 
         for doc_id, content, metadata in zip(doc_ids, documents, metadatas):
             self._doc_store[doc_id] = {
@@ -355,14 +560,14 @@ class VectorStore:
             query_embeddings=[query_embedding],
             n_results=candidate_limit,
             where=where_clause if where_clause else None,
-            include=["ids", "documents", "metadatas", "distances"]
+            include=["documents", "metadatas", "distances"]
         )
 
         formatted_results = []
-        ids = results.get("ids", [[]])[0]
         documents = results.get("documents", [[]])[0]
         metadatas = results.get("metadatas", [[]])[0]
         distances = results.get("distances", [[]])[0]
+        ids = results.get("ids", [[]])[0] if results.get("ids") is not None else []
 
         for i, doc_id in enumerate(ids):
             metadata = metadatas[i] if i < len(metadatas) else {}
@@ -491,7 +696,7 @@ class VectorStore:
 
         return hybrid_results
 
-    def add_text(self, 
+    def add_text(self,
                  text_id: str,
                  content: str,
                  metadata: Dict[str, Any],
@@ -512,12 +717,17 @@ class VectorStore:
         
         # 计算embedding
         if embedding is None:
-            if self.use_enhanced_embedding:
+            if self.embedding_backend == 'hf':
+                embedding = self._get_hf_embedding(content)
+            elif self.use_enhanced_embedding and (self.api_key or self.embedding_backend == 'hf'):
                 # 使用多语言感知的增强嵌入
                 embedding = self._get_embedding_enhanced(content)
-            else:
-                # 使用标准嵌入
+            elif self.api_key:
+                # 使用标准OpenAI或DashScope嵌入
                 embedding = self._get_embedding(content)
+            else:
+                # 本地fallback embedding
+                embedding = self._get_local_embedding(content)
         
         # 添加到集合
         self.collection.add(
