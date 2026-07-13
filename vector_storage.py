@@ -34,6 +34,8 @@ try:
 except ImportError:
     SentenceTransformer = None
 
+from evaluation.retrieval_experiment_utils import normalize_stock_code
+
 
 class VectorStore:
     """
@@ -51,10 +53,14 @@ class VectorStore:
         self.embedding_model = embedding_model
         self.use_enhanced_embedding = use_enhanced_embedding
         self.use_hybrid_retrieval = use_hybrid_retrieval
+        self.force_local_embedding = False
+        self.local_embedding_dim = int(os.getenv("LOCAL_EMBEDDING_DIM", "384"))
+        self.hf_pooling = (os.getenv("HF_POOLING") or "auto").strip().lower()
         # 支持多种 LLM 提供方的环境变量名（OpenAI / DashScope / 通用 LLM_API_KEY）
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         self.dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
         self.llm_api_key = os.getenv("LLM_API_KEY")
+        embedding_backend_pref = (os.getenv("EMBEDDING_BACKEND") or "auto").strip().lower()
 
         # DashScope base URL（兼容模式）
         # 优先使用兼容模式专用 URL，避免老旧 API_URL 覆盖可用的兼容端点
@@ -69,8 +75,20 @@ class VectorStore:
         if hf_model:
             self.embedding_model = hf_model
 
-        # 决定使用哪个嵌入后端：hf > dashscope > openai > local
-        if hf_model or ('/' in str(self.embedding_model) and self.embedding_model.lower().startswith('qwen')):
+        # 决定使用哪个嵌入后端：显式配置优先，其次自动推断
+        if embedding_backend_pref == "local":
+            self.embedding_backend = "local"
+            self.api_key = None
+        elif embedding_backend_pref == "openai":
+            self.embedding_backend = "openai"
+            self.api_key = self.openai_api_key or self.llm_api_key
+        elif embedding_backend_pref == "dashscope":
+            self.embedding_backend = "dashscope"
+            self.api_key = self.dashscope_api_key
+        elif embedding_backend_pref == "hf":
+            self.embedding_backend = "hf"
+            self.api_key = None
+        elif hf_model or ('/' in str(self.embedding_model) and self.embedding_model.lower().startswith('qwen')):
             self.embedding_backend = 'hf'
             self.api_key = None
         elif self.dashscope_api_url and self.dashscope_api_key:
@@ -110,6 +128,9 @@ class VectorStore:
         if self.hybrid_dense_weight + self.hybrid_bm25_weight == 0:
             self.hybrid_dense_weight = 0.5
             self.hybrid_bm25_weight = 0.5
+        self.hybrid_rrf_k: int = int(os.getenv('HYBRID_RRF_K', '60'))
+        self.collection_name = collection_name
+        self.collection_metadata = {"hnsw:space": "cosine"}
         
         # 初始化ChromaDB客户端
         self.client = chromadb.Client(Settings(
@@ -119,8 +140,8 @@ class VectorStore:
 
         # 获取或创建集合
         self.collection = self.client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"}  # 使用余弦相似度
+            name=self.collection_name,
+            metadata=self.collection_metadata  # 使用余弦相似度
         )
 
         # 初始化嵌入客户端（根据之前决定的 embedding_backend）
@@ -141,29 +162,35 @@ class VectorStore:
             self.embed_client = SentenceTransformer('all-MiniLM-L6-v2')
             print('✅ 使用本地 sentence-transformers 作为嵌入回退方案')
         else:
-            raise RuntimeError(
-                '缺少 OpenAI API KEY，且 sentence-transformers 未安装，无法生成嵌入。'
-            )
+            self.embed_client = None
+            print(f'✅ 使用本地哈希嵌入回退方案，维度={self.local_embedding_dim}')
     
     def _get_embedding(self, text: str) -> List[float]:
         """获取文本的向量嵌入"""
         # 截断长文本
         text = text[:8000] if len(text) > 8000 else text
 
+        if self.force_local_embedding:
+            return self._get_local_embedding(text)
+
         # DashScope HTTP 调用
-        if self.embedding_backend == "dashscope":
-            return self._dashscope_get_embedding(text, model=self.embedding_model)
+        try:
+            if self.embedding_backend == "dashscope":
+                return self._dashscope_get_embedding(text, model=self.embedding_model)
 
-        if self.embedding_backend == 'hf':
-            return self._get_hf_embedding(text)
+            if self.embedding_backend == 'hf':
+                return self._get_hf_embedding(text)
 
-        # OpenAI 客户端
-        if self.embedding_backend == "openai" and self.embed_client is not None:
-            response = self.embed_client.embeddings.create(
-                model=self.embedding_model,
-                input=text
-            )
-            return response.data[0].embedding
+            # OpenAI 客户端
+            if self.embedding_backend == "openai" and self.embed_client is not None:
+                response = self.embed_client.embeddings.create(
+                    model=self.embedding_model,
+                    input=text
+                )
+                return response.data[0].embedding
+        except Exception as e:
+            print(f"⚠️  外部嵌入后端不可用，切换到本地哈希嵌入: {e}")
+            self.force_local_embedding = True
 
         return self._get_local_embedding(text)
 
@@ -234,11 +261,30 @@ class VectorStore:
 
     def _get_local_embedding(self, text: str) -> List[float]:
         """使用本地句子嵌入模型生成向量"""
-        if SentenceTransformer is None:
-            raise RuntimeError('sentence-transformers 未安装，无法生成本地嵌入。')
-        # 创建独立的本地模型实例以避免与 OpenAI 客户端冲突
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        return model.encode(text, convert_to_numpy=True).tolist()
+        if SentenceTransformer is not None:
+            model = SentenceTransformer('all-MiniLM-L6-v2')
+            return model.encode(text, convert_to_numpy=True).tolist()
+        return self._get_hash_embedding(text)
+
+    def _get_hash_embedding(self, text: str, dim: Optional[int] = None) -> List[float]:
+        """Deterministic local fallback embedding when no model service is available."""
+        dim = dim or self.local_embedding_dim
+        vector = [0.0] * dim
+        tokens = self._tokenize_for_bm25(text)
+        if not tokens:
+            return vector
+
+        for token in tokens:
+            token_hash = hashlib.md5(token.encode("utf-8")).hexdigest()
+            index = int(token_hash[:8], 16) % dim
+            sign = 1.0 if int(token_hash[8:10], 16) % 2 == 0 else -1.0
+            weight = 1.0 + min(len(token), 12) / 12.0
+            vector[index] += sign * weight
+
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm > 0:
+            vector = [value / norm for value in vector]
+        return vector
 
     def _load_hf_model(self, model_name: Optional[str] = None):
         if AutoTokenizer is None or AutoModel is None or torch is None:
@@ -247,12 +293,54 @@ class VectorStore:
         model_name = model_name or self.embedding_model
         if self.hf_model_name != model_name or self.hf_tokenizer is None or self.hf_model is None:
             print(f'⚙️ 加载 HuggingFace 模型 {model_name} 到 {self.hf_device}')
-            self.hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            tokenizer_kwargs = {}
+            if "qwen" in str(model_name).lower():
+                tokenizer_kwargs["padding_side"] = "left"
+            self.hf_tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
             self.hf_model = AutoModel.from_pretrained(model_name).to(self.hf_device)
             self.hf_model.eval()
             self.hf_model_name = model_name
 
         return self.hf_tokenizer, self.hf_model
+
+    def _should_use_last_token_pooling(self, model_name: str) -> bool:
+        if self.hf_pooling == "last_token":
+            return True
+        if self.hf_pooling == "mean":
+            return False
+        return "qwen" in str(model_name).lower()
+
+    def _last_token_pool(
+        self,
+        last_hidden_state,
+        attention_mask,
+    ):
+        if attention_mask is None:
+            return last_hidden_state[:, -1]
+
+        # Qwen embeddings prefer left padding + last token pooling.
+        left_padding = bool((attention_mask[:, -1] == 1).all().item())
+        if left_padding:
+            return last_hidden_state[:, -1]
+
+        seq_lens = attention_mask.sum(dim=1) - 1
+        batch_size = last_hidden_state.shape[0]
+        return last_hidden_state[
+            torch.arange(batch_size, device=last_hidden_state.device),
+            seq_lens,
+        ]
+
+    def _mean_pool(
+        self,
+        last_hidden_state,
+        attention_mask,
+    ):
+        if attention_mask is None:
+            return last_hidden_state.mean(dim=1)
+        mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+        summed = (last_hidden_state * mask).sum(dim=1)
+        counts = mask.sum(dim=1).clamp(min=1e-9)
+        return summed / counts
 
     def _get_hf_embedding(self, text: str, model_override: Optional[str] = None) -> List[float]:
         model_name = model_override or self.embedding_model
@@ -274,17 +362,18 @@ class VectorStore:
         if hasattr(outputs, 'last_hidden_state'):
             hidden_states = outputs.last_hidden_state
             attention_mask = inputs.get('attention_mask')
-            if attention_mask is not None:
-                mask = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
-                summed = (hidden_states * mask).sum(dim=1)
-                counts = mask.sum(dim=1).clamp(min=1e-9)
-                embedding = summed / counts
+            if self._should_use_last_token_pooling(model_name):
+                embedding = self._last_token_pool(hidden_states, attention_mask)
             else:
-                embedding = hidden_states.mean(dim=1)
+                embedding = self._mean_pool(hidden_states, attention_mask)
         elif hasattr(outputs, 'pooler_output'):
             embedding = outputs.pooler_output
         else:
             raise RuntimeError('无法从 HuggingFace 模型输出中提取 embedding')
+
+        if torch is not None:
+            embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
+            embedding = embedding.to(torch.float32)
 
         return embedding[0].cpu().numpy().tolist()
     
@@ -312,6 +401,9 @@ class VectorStore:
 
         if not self.api_key:
             # 本地 fallback 时不使用 OpenAI 增强策略
+            return self._get_local_embedding(text)
+
+        if self.force_local_embedding:
             return self._get_local_embedding(text)
 
         # 截断长文本
@@ -364,6 +456,7 @@ class VectorStore:
             return embedding
         except Exception as e:
             print(f"❌ 嵌入生成失败: {str(e)}, 使用本地模型降级")
+            self.force_local_embedding = True
             if self.embedding_backend == 'dashscope' and embedding_model == 'text-embedding-v3':
                 # 如果 DashScope 上 text-embedding-v3 不可用，则尝试 v4
                 print('⚠️ DashScope text-embedding-v3 无法访问，改用 text-embedding-v4 重试')
@@ -382,6 +475,129 @@ class VectorStore:
             return parse(value)
         except Exception:
             return None
+
+    def reset_collection(self):
+        """Reset the underlying Chroma collection so experiments start from a clean index."""
+        try:
+            self.client.delete_collection(self.collection_name)
+        except Exception:
+            try:
+                existing = self.collection.get(include=[])
+                ids = existing.get("ids", []) if existing else []
+                if ids:
+                    self.collection.delete(ids=ids)
+            except Exception:
+                pass
+
+        self.collection = self.client.get_or_create_collection(
+            name=self.collection_name,
+            metadata=self.collection_metadata
+        )
+        self._doc_store = {}
+        self._bm25_index_built = False
+        self._bm25_doc_freq = Counter()
+        self._bm25_doc_term_freqs = {}
+        self._bm25_doc_lengths = {}
+        self._bm25_avgdl = 0.0
+
+    def get_indexed_text_ids(self) -> set[str]:
+        """Return text_ids already stored in the current collection."""
+        indexed_text_ids: set[str] = set()
+        try:
+            results = self.collection.get(include=["metadatas"])
+        except Exception:
+            return indexed_text_ids
+
+        for metadata in results.get("metadatas", []) or []:
+            if isinstance(metadata, dict):
+                text_id = str(metadata.get("text_id", "")).strip()
+                if text_id:
+                    indexed_text_ids.add(text_id)
+        return indexed_text_ids
+
+    def _normalize_stock_code(self, stock_code: Optional[str]) -> str:
+        return normalize_stock_code(stock_code)
+
+    def _normalize_query(self, query: str, stock_code: Optional[str] = None) -> str:
+        normalized_query = re.sub(r"\s+", " ", (query or "")).strip()
+        expansions = []
+
+        if stock_code:
+            normalized_code = self._normalize_stock_code(stock_code)
+            if normalized_code:
+                expansions.extend([normalized_code, normalized_code.split(".")[0]])
+
+        for token in re.findall(r"\b\d{1,5}(?:\.hk)?\b", normalized_query, flags=re.IGNORECASE):
+            normalized_code = self._normalize_stock_code(token)
+            if normalized_code:
+                expansions.extend([normalized_code, normalized_code.split(".")[0]])
+
+        seen = set()
+        deduped = []
+        lower_query = normalized_query.lower()
+        for token in expansions:
+            token = token.strip()
+            if not token:
+                continue
+            lowered = token.lower()
+            if lowered in seen or lowered in lower_query:
+                continue
+            seen.add(lowered)
+            deduped.append(token)
+
+        if deduped:
+            normalized_query = f"{normalized_query} {' '.join(deduped)}".strip()
+        return normalized_query
+
+    def _compose_search_text(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+        metadata = metadata or {}
+        pieces = []
+
+        title = metadata.get("title")
+        if title:
+            pieces.append(str(title).strip())
+
+        stock_names = metadata.get("stock_names") or metadata.get("stock_name")
+        if stock_names:
+            if isinstance(stock_names, list):
+                names = [str(name).strip() for name in stock_names if str(name).strip()]
+            else:
+                names = [name.strip() for name in str(stock_names).split(",") if name.strip()]
+            if names:
+                pieces.append(" ".join(names))
+
+        stock_codes = metadata.get("stock_codes") or metadata.get("stock_code")
+        if stock_codes:
+            if isinstance(stock_codes, list):
+                codes = [self._normalize_stock_code(code) for code in stock_codes if str(code).strip()]
+            else:
+                codes = [
+                    self._normalize_stock_code(code)
+                    for code in str(stock_codes).split(",")
+                    if code.strip()
+                ]
+            codes = [code for code in codes if code]
+            if codes:
+                pieces.append(" ".join(codes))
+
+        source = metadata.get("source") or metadata.get("source_type")
+        if source:
+            pieces.append(str(source).strip())
+
+        if content:
+            pieces.append(str(content).strip())
+
+        unique_pieces = []
+        seen = set()
+        for piece in pieces:
+            cleaned = re.sub(r"\s+", " ", piece).strip()
+            lowered = cleaned.lower()
+            if not cleaned or lowered in seen:
+                continue
+            seen.add(lowered)
+            unique_pieces.append(cleaned)
+
+        return "\n".join(unique_pieces)
     
     def _tokenize_for_bm25(self, text: str) -> List[str]:
         if not text:
@@ -414,6 +630,7 @@ class VectorStore:
         for doc_id, content, metadata in zip(doc_ids, documents, metadatas):
             self._doc_store[doc_id] = {
                 "content": content,
+                "search_text": self._compose_search_text(content, metadata or {}),
                 "metadata": metadata or {}
             }
     
@@ -424,7 +641,7 @@ class VectorStore:
         self._bm25_doc_lengths = {}
 
         for doc_id, doc in self._doc_store.items():
-            tokens = self._tokenize_for_bm25(doc["content"])
+            tokens = self._tokenize_for_bm25(doc.get("search_text") or doc["content"])
             term_freq = Counter(tokens)
             self._bm25_doc_term_freqs[doc_id] = term_freq
             self._bm25_doc_lengths[doc_id] = len(tokens)
@@ -451,7 +668,9 @@ class VectorStore:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
     ) -> bool:
-        if stock_code and metadata.get("stock_code") != stock_code:
+        normalized_stock_code = self._normalize_stock_code(stock_code)
+        metadata_stock_code = self._normalize_stock_code(metadata.get("stock_code"))
+        if normalized_stock_code and metadata_stock_code != normalized_stock_code:
             return False
         if filter_type and metadata.get("type") != filter_type:
             return False
@@ -467,7 +686,7 @@ class VectorStore:
             if sentiment_score is None or float(sentiment_score) > max_sentiment:
                 return False
 
-        created_at = metadata.get("created_at") or metadata.get("publish_time")
+        created_at = metadata.get("created_at") or metadata.get("publish_time") or metadata.get("published_at")
         created_at_dt = self._normalize_date(created_at)
         if start_date:
             start_dt = self._normalize_date(start_date)
@@ -572,6 +791,7 @@ class VectorStore:
         n_results: int = 5,
         use_enhanced_query_embedding: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
+        query = self._normalize_query(query, stock_code=stock_code)
         if use_enhanced_query_embedding is None:
             use_enhanced_query_embedding = self.use_enhanced_embedding
 
@@ -640,6 +860,7 @@ class VectorStore:
         end_date: Optional[str] = None,
         n_results: int = 5,
     ) -> List[Dict[str, Any]]:
+        query = self._normalize_query(query, stock_code=stock_code)
         candidate_ids = self._filter_doc_ids(
             stock_code=stock_code,
             filter_type=filter_type,
@@ -666,6 +887,8 @@ class VectorStore:
         n_results: int = 5,
         use_enhanced_query_embedding: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
+        query = self._normalize_query(query, stock_code=stock_code)
+        candidate_pool_size = max(n_results * 4, 30)
         dense_results = self.search_dense(
             query=query,
             stock_code=stock_code,
@@ -676,7 +899,7 @@ class VectorStore:
             max_sentiment=max_sentiment,
             start_date=start_date,
             end_date=end_date,
-            n_results=max(n_results * 2, 20),
+            n_results=candidate_pool_size,
             use_enhanced_query_embedding=use_enhanced_query_embedding,
         )
         bm25_results = self.search_bm25(
@@ -689,7 +912,7 @@ class VectorStore:
             max_sentiment=max_sentiment,
             start_date=start_date,
             end_date=end_date,
-            n_results=max(n_results * 2, 20),
+            n_results=candidate_pool_size,
         )
 
         # Build a candidate set from both dense and BM25 results
@@ -721,7 +944,7 @@ class VectorStore:
         if not candidate_map:
             return []
 
-        # Normalize scores to [0,1] for effective fusion
+        # Reciprocal Rank Fusion is more stable than raw-score normalization across dense/BM25.
         max_dense = max((item["dense_score"] for item in candidate_map.values()), default=1.0)
         max_bm25 = max((item["bm25_score"] for item in candidate_map.values()), default=1.0)
         max_dense = max_dense if max_dense > 0 else 1.0
@@ -731,9 +954,13 @@ class VectorStore:
         for doc_id, item in candidate_map.items():
             dense_norm = item["dense_score"] / max_dense if item["dense_score"] else 0.0
             bm25_norm = item["bm25_score"] / max_bm25 if item["bm25_score"] else 0.0
+            dense_rrf = 1.0 / (self.hybrid_rrf_k + item["dense_rank"]) if item["dense_rank"] else 0.0
+            bm25_rrf = 1.0 / (self.hybrid_rrf_k + item["bm25_rank"]) if item["bm25_rank"] else 0.0
             hybrid_score = (
-                self.hybrid_dense_weight * dense_norm +
-                self.hybrid_bm25_weight * bm25_norm
+                self.hybrid_dense_weight * dense_rrf +
+                self.hybrid_bm25_weight * bm25_rrf +
+                0.05 * self.hybrid_dense_weight * dense_norm +
+                0.05 * self.hybrid_bm25_weight * bm25_norm
             )
             hybrid_results.append({
                 "id": doc_id,
@@ -767,20 +994,21 @@ class VectorStore:
         """
         # 生成唯一ID
         doc_id = hashlib.md5(f"{text_id}_{metadata.get('stock_code', 'unknown')}".encode()).hexdigest()
+        search_text = self._compose_search_text(content, metadata)
         
         # 计算embedding
         if embedding is None:
             if self.embedding_backend == 'hf':
-                embedding = self._get_hf_embedding(content)
+                embedding = self._get_hf_embedding(search_text)
             elif self.use_enhanced_embedding and (self.api_key or self.embedding_backend == 'hf'):
                 # 使用多语言感知的增强嵌入
-                embedding = self._get_embedding_enhanced(content)
+                embedding = self._get_embedding_enhanced(search_text)
             elif self.api_key:
                 # 使用标准OpenAI或DashScope嵌入
-                embedding = self._get_embedding(content)
+                embedding = self._get_embedding(search_text)
             else:
                 # 本地fallback embedding
-                embedding = self._get_local_embedding(content)
+                embedding = self._get_local_embedding(search_text)
         
         doc_metadata = {
             "text_id": text_id,
@@ -789,6 +1017,7 @@ class VectorStore:
         }
         self._doc_store[doc_id] = {
             "content": content,
+            "search_text": search_text,
             "metadata": doc_metadata
         }
 
@@ -796,12 +1025,20 @@ class VectorStore:
         self._bm25_index_built = False
 
         # 添加到集合
-        self.collection.add(
-            ids=[doc_id],
-            embeddings=[embedding],
-            documents=[content],
-            metadatas=[doc_metadata]
-        )
+        try:
+            self.collection.upsert(
+                ids=[doc_id],
+                embeddings=[embedding],
+                documents=[content],
+                metadatas=[doc_metadata]
+            )
+        except AttributeError:
+            self.collection.add(
+                ids=[doc_id],
+                embeddings=[embedding],
+                documents=[content],
+                metadatas=[doc_metadata]
+            )
         
         return doc_id
     

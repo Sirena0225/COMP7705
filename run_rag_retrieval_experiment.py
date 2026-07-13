@@ -16,6 +16,10 @@ load_dotenv()
 
 from vector_storage import VectorStore
 from evaluation.retrieval_eval import evaluate_retrieval_quality
+from evaluation.retrieval_experiment_utils import (
+    generate_test_queries_from_documents,
+    normalize_stock_code,
+)
 
 
 class RAGExperiment:
@@ -51,7 +55,7 @@ class RAGExperiment:
         print(f"  • 来源类型: {dict(sources)}")
         print(f"  • 语言分布: {dict(languages)}")
     
-    def build_vector_store(self, use_enhanced=True, use_hybrid=True):
+    def build_vector_store(self, use_enhanced=True, use_hybrid=True, reset_store=True):
         """构建向量库"""
         print("\n" + "="*70)
         print("🔨 步骤2: 构建向量库")
@@ -68,6 +72,13 @@ class RAGExperiment:
             use_enhanced_embedding=use_enhanced,
             use_hybrid_retrieval=use_hybrid,
         )
+        if reset_store:
+            self.vector_store.reset_collection()
+            existing_text_ids = set()
+        else:
+            existing_text_ids = self.vector_store.get_indexed_text_ids()
+            if existing_text_ids:
+                print(f"  • 检测到已有索引文档: {len(existing_text_ids)} 条，将跳过已完成部分")
         backend = self.vector_store.embedding_backend
         if backend == "dashscope":
             print(f"  • 嵌入后端: 阿里云百炼 (DashScope)")
@@ -80,16 +91,25 @@ class RAGExperiment:
         
         start_time = time.time()
         success_count = 0
+        skipped_count = 0
         
         for i, item in enumerate(self.raw_data):
             try:
-                stock_codes = item.get('stock_codes', [])
+                text_id = item.get('text_id', f'doc_{i}')
+                if text_id in existing_text_ids:
+                    skipped_count += 1
+                    continue
+
+                stock_codes = [normalize_stock_code(code) for code in item.get('stock_codes', [])]
+                stock_codes = [code for code in stock_codes if code]
                 self.vector_store.add_text(
-                    text_id=item.get('text_id', f'doc_{i}'),
+                    text_id=text_id,
                     content=item.get('content', item.get('title', '')),
                     metadata={
                         'stock_code': stock_codes[0] if stock_codes else 'unknown',
                         'stock_codes': ','.join(stock_codes),
+                        'stock_names': ','.join(item.get('stock_names', [])),
+                        'title': item.get('title', ''),
                         'source': item.get('source_type', 'unknown'),
                         'language': item.get('language', 'en'),
                         'published_at': item.get('published_at', ''),
@@ -107,12 +127,16 @@ class RAGExperiment:
         build_time = time.time() - start_time
         
         print(f"\n✅ 向量库构建完成")
-        print(f"  • 成功处理: {success_count}/{len(self.raw_data)}")
+        print(f"  • 新增处理: {success_count}/{len(self.raw_data)}")
+        print(f"  • 跳过已有: {skipped_count}/{len(self.raw_data)}")
+        print(f"  • 累计可用: {success_count + skipped_count}/{len(self.raw_data)}")
         print(f"  • 耗时: {build_time:.2f}s")
-        print(f"  • 平均速度: {success_count/build_time:.1f} 条/秒")
+        throughput = success_count / build_time if build_time > 0 else 0.0
+        print(f"  • 平均速度: {throughput:.1f} 条/秒")
         
         self.results['build_time'] = build_time
         self.results['success_count'] = success_count
+        self.results['skipped_count'] = skipped_count
     
     def generate_test_queries(self, min_docs_per_stock=2, max_queries_per_stock=3):
         """从数据中生成测试查询"""
@@ -120,41 +144,25 @@ class RAGExperiment:
         print("📝 步骤3: 生成测试查询")
         print("="*70)
         
-        # 按股票分组
-        stocks_data = defaultdict(list)
+        stocks_data = defaultdict(int)
         for item in self.raw_data:
             for stock_code in item.get('stock_codes', []):
-                stocks_data[stock_code].append(item)
-        
+                stocks_data[stock_code] += 1
+
         print(f"✅ 从数据中提取了 {len(stocks_data)} 个不同的股票代码")
-        
-        # 为每个股票创建查询
-        self.test_queries = []
-        
-        for stock_code, docs in stocks_data.items():
-            if len(docs) < min_docs_per_stock:
-                continue
-            
-            # 从文本中提取查询
-            for doc in docs[:max_queries_per_stock]:
-                content = doc.get('content', '')
-                title = doc.get('title', '')
-                
-                # 使用标题或前80个字符作为查询
-                query_text = (title if title else content)[:100]
-                
-                # 找到同股票的其他相关文本
-                relevant_ids = [
-                    d.get('text_id', '') for d in docs 
-                    if d.get('text_id', '') and d != doc
-                ]
-                
-                if query_text and relevant_ids:
-                    self.test_queries.append({
-                        'query': query_text,
-                        'stock_code': stock_code,
-                        'relevant_ids': relevant_ids,
-                    })
+
+        self.test_queries = generate_test_queries_from_documents(
+            self.raw_data,
+            min_docs_per_stock=min_docs_per_stock,
+            max_queries_per_stock=max_queries_per_stock,
+        )
+        if not self.test_queries:
+            self.test_queries = generate_test_queries_from_documents(
+                self.raw_data,
+                min_docs_per_stock=min_docs_per_stock,
+                max_queries_per_stock=max_queries_per_stock,
+                min_topic_overlap=0.03,
+            )
         
         print(f"✅ 生成了 {len(self.test_queries)} 个测试查询")
         print(f"\n📌 查询示例:")
@@ -163,6 +171,7 @@ class RAGExperiment:
             print(f"    文本: {q['query'][:60]}...")
             print(f"    股票: {q['stock_code']}")
             print(f"    相关文档: {len(q['relevant_ids'])} 个")
+            print(f"    排除原文: {q.get('source_text_id', '')}")
     
     def evaluate_retrieval(self, retrieval_k=10):
         """评估检索精度（Top-1 Accuracy / Top-5 Recall / MRR / NDCG@5 / 延迟）"""
@@ -253,7 +262,9 @@ class RAGExperiment:
                 'eval_time_seconds': self.results.get('eval_time', 0),
             },
             'quality': {
-                'successful_samples': self.results.get('success_count', 0),
+                'successful_samples': self.results.get('success_count', 0) + self.results.get('skipped_count', 0),
+                'newly_processed_samples': self.results.get('success_count', 0),
+                'skipped_existing_samples': self.results.get('skipped_count', 0),
             },
             'retrieval_metrics': {
                 'top1_accuracy': metrics.get('top1_accuracy'),
@@ -270,7 +281,7 @@ class RAGExperiment:
         
         print(f"\n✅ 结果已保存到: {filename}")
     
-    def run_complete_experiment(self, use_enhanced=True, use_hybrid=True):
+    def run_complete_experiment(self, use_enhanced=True, use_hybrid=True, reset_store=True):
         """运行完整实验"""
         print("\n" + "#"*70)
         print("# RAG 检索精度完整实验")
@@ -278,7 +289,11 @@ class RAGExperiment:
         
         # 执行步骤
         self.load_data()
-        self.build_vector_store(use_enhanced=use_enhanced, use_hybrid=use_hybrid)
+        self.build_vector_store(
+            use_enhanced=use_enhanced,
+            use_hybrid=use_hybrid,
+            reset_store=reset_store,
+        )
         self.generate_test_queries()
         self.evaluate_retrieval()
         self.display_results()
@@ -292,12 +307,14 @@ class RAGExperiment:
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='Run RAG retrieval experiments.')
+    parser.add_argument('--data-path', default='data/sentiment_input_batch.json', help='Path to the retrieval experiment dataset JSON file.')
     parser.add_argument('--no-hybrid', action='store_true', help='Use pure dense retrieval instead of hybrid dense+BM25.')
     parser.add_argument('--no-enhanced', action='store_true', help='Disable enhanced embedding and use base embedding only.')
+    parser.add_argument('--keep-existing-index', action='store_true', help='Reuse the current collection instead of rebuilding from a clean index.')
     args = parser.parse_args()
 
     # 确保数据文件存在
-    data_path = 'data/sentiment_input_batch.json'
+    data_path = args.data_path
     if not Path(data_path).exists():
         print(f"❌ 错误: 未找到数据文件 {data_path}")
         print("请确保已正确放置数据文件")
@@ -309,7 +326,8 @@ def main():
     # 运行实验
     experiment.run_complete_experiment(
         use_enhanced=not args.no_enhanced,
-        use_hybrid=not args.no_hybrid
+        use_hybrid=not args.no_hybrid,
+        reset_store=not args.keep_existing_index,
     )
 
     # 可选: 对比实验
