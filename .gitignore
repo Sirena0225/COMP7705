@@ -8,6 +8,8 @@
 .env.*.local
 *.key
 *.pem
+.vendor/
+.vendor_hf/
 
 # -------- Python --------
 __pycache__/
@@ -71,6 +73,7 @@ logs/
 chroma_db/
 rag_db/
 rag_db_test/
+rag_db_eval/
 
 # -------- 输出文件 --------
 output/
@@ -92,6 +95,7 @@ temp/
 # -------- 缓存 --------
 .cache/
 *.cache
+.hf_cache/
 .mypy_cache/
 .dmypy.json
 dmypy.json

@@ -1,9 +1,18 @@
 """
 RAG retrieval quality evaluation metrics
 """
+import math
 import time
 from typing import List, Dict, Any
-import numpy as np
+
+
+def _normalize_id_list(values: List[str]) -> List[str]:
+    normalized = []
+    for value in values or []:
+        text = str(value).strip()
+        if text:
+            normalized.append(text)
+    return normalized
 
 
 def calculate_top1_accuracy(retrieved_ids: List[str], relevant_ids: List[str]) -> float:
@@ -41,7 +50,7 @@ def calculate_ndcg_at_k(
         score = 0.0
         for rank, doc_id in enumerate(ids[:max_k], 1):
             if doc_id in relevant_set:
-                score += 1.0 / np.log2(rank + 1)
+                score += 1.0 / math.log2(rank + 1)
         return score
 
     relevant_set = set(relevant_ids)
@@ -95,10 +104,20 @@ def evaluate_retrieval_quality(
         )
         latency_ms = (time.perf_counter() - t0) * 1000
 
-        retrieved_ids = [
+        raw_retrieved_ids = [
             doc["metadata"].get("text_id", doc["id"]) for doc in retrieved
         ]
-        relevant_ids = query_item["relevant_ids"]
+        exclude_ids = set(_normalize_id_list(query_item.get("exclude_ids", [])))
+        exclude_ids.update(_normalize_id_list(query_item.get("exclude_text_ids", [])))
+        source_text_id = str(query_item.get("source_text_id", "")).strip()
+        if source_text_id:
+            exclude_ids.add(source_text_id)
+
+        retrieved_ids = [
+            doc_id for doc_id in _normalize_id_list(raw_retrieved_ids)
+            if doc_id not in exclude_ids
+        ]
+        relevant_ids = _normalize_id_list(query_item["relevant_ids"])
 
         per_query["top1_accuracy"].append(
             calculate_top1_accuracy(retrieved_ids, relevant_ids)
@@ -113,7 +132,7 @@ def evaluate_retrieval_quality(
         per_query["retrieval_latency_ms"].append(latency_ms)
 
     def mean(values: List[float]) -> float:
-        return float(np.mean(values)) if values else 0.0
+        return float(sum(values) / len(values)) if values else 0.0
 
     return {
         "top1_accuracy": mean(per_query["top1_accuracy"]),
